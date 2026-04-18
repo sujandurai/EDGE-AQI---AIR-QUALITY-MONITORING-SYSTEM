@@ -579,12 +579,12 @@ static void tft_reset(void) {
 
 static void tft_init(void) {
   // -------------------------------------------------------------
-  // ILI9341 / ST7789 2.5" 240x320 TFT Initialization
+  // ILI9341 2.5" 320x240 – Full initialization sequence
   // -------------------------------------------------------------
   TFT_RST_HIGH();
-  delay_ms(1);
-  TFT_RST_LOW();
   delay_ms(5);
+  TFT_RST_LOW();
+  delay_ms(20);
   TFT_RST_HIGH();
   delay_ms(150);
 
@@ -596,11 +596,81 @@ static void tft_init(void) {
   tft_write_cmd(0x11); // SLPOUT
   delay_ms(150);
 
-  tft_write_cmd(0x3A); // COLMOD
-  tft_write_data(0x05); // 16-bit color
+  // Power control A
+  tft_write_cmd(0xCB);
+  tft_write_data(0x39); tft_write_data(0x2C); tft_write_data(0x00);
+  tft_write_data(0x34); tft_write_data(0x02);
 
-  tft_write_cmd(0x36); // MADCTL
-  tft_write_data(0x28); // Landscape 320x240 (MV=1, BGR=0)
+  // Power control B
+  tft_write_cmd(0xCF);
+  tft_write_data(0x00); tft_write_data(0xC1); tft_write_data(0x30);
+
+  // Driver timing control A
+  tft_write_cmd(0xE8);
+  tft_write_data(0x85); tft_write_data(0x00); tft_write_data(0x78);
+
+  // Driver timing control B
+  tft_write_cmd(0xEA);
+  tft_write_data(0x00); tft_write_data(0x00);
+
+  // Power on sequence control
+  tft_write_cmd(0xED);
+  tft_write_data(0x64); tft_write_data(0x03);
+  tft_write_data(0x12); tft_write_data(0x81);
+
+  // Pump ratio control
+  tft_write_cmd(0xF7); tft_write_data(0x20);
+
+  // Power Control 1
+  tft_write_cmd(0xC0); tft_write_data(0x23);
+
+  // Power Control 2
+  tft_write_cmd(0xC1); tft_write_data(0x10);
+
+  // VCOM Control 1
+  tft_write_cmd(0xC5);
+  tft_write_data(0x3E); tft_write_data(0x28);
+
+  // VCOM Control 2
+  tft_write_cmd(0xC7); tft_write_data(0x86);
+
+  // COLMOD: 16-bit color (RGB565)
+  tft_write_cmd(0x3A); tft_write_data(0x55);
+
+  // Frame Rate Control
+  tft_write_cmd(0xB1);
+  tft_write_data(0x00); tft_write_data(0x18);
+
+  // Display Function Control
+  tft_write_cmd(0xB6);
+  tft_write_data(0x08); tft_write_data(0x82); tft_write_data(0x27);
+
+  // Gamma Function Disable
+  tft_write_cmd(0xF2); tft_write_data(0x00);
+
+  // Gamma curve selected
+  tft_write_cmd(0x26); tft_write_data(0x01);
+
+  // Positive Gamma Correction
+  tft_write_cmd(0xE0);
+  tft_write_data(0x0F); tft_write_data(0x31); tft_write_data(0x2B);
+  tft_write_data(0x0C); tft_write_data(0x0E); tft_write_data(0x08);
+  tft_write_data(0x4E); tft_write_data(0xF1); tft_write_data(0x37);
+  tft_write_data(0x07); tft_write_data(0x10); tft_write_data(0x03);
+  tft_write_data(0x0E); tft_write_data(0x09); tft_write_data(0x00);
+
+  // Negative Gamma Correction
+  tft_write_cmd(0xE1);
+  tft_write_data(0x00); tft_write_data(0x0E); tft_write_data(0x14);
+  tft_write_data(0x03); tft_write_data(0x11); tft_write_data(0x07);
+  tft_write_data(0x31); tft_write_data(0xC1); tft_write_data(0x48);
+  tft_write_data(0x08); tft_write_data(0x0F); tft_write_data(0x0C);
+  tft_write_data(0x31); tft_write_data(0x36); tft_write_data(0x0F);
+
+  // MADCTL: Landscape 320x240
+  // 0x60 = MX|MV  -> scan right-to-left, row/col exchange -> correct landscape
+  // If image still mirrors, try 0xA0 (MY|MV) or 0xE0 (MY|MX|MV)
+  tft_write_cmd(0x36); tft_write_data(0x60); // MX|MV landscape (no BGR)
 
   tft_write_cmd(0x29); // DISPON
   delay_ms(50);
@@ -1125,16 +1195,25 @@ static void draw_bottom_wave(uint16_t active_color, uint8_t wt,
 // Holds for 5 seconds then fades out with a top→bottom white wipe.
 // ============================================================
 static void draw_logo_page(void) {
-  // ---- Display the exact combined logo bitmap (full screen 160x128) ----
-  tft_draw_bitmap(0, 0, LOGO_W, LOGO_H, bannari_logo);
+  // The logo bitmap is 160x128 logical (320x256 scaled).
+  // The physical screen is 320x240 so only 120 logical rows (240px) fit.
+  // Crop to LOGO_H or 120, whichever fits.
+  uint16_t draw_h = (LOGO_H <= 120) ? LOGO_H : 120;
+
+  // ---- Display the bitmap centred or from top ----
+  tft_draw_bitmap(0, 0, LOGO_W, draw_h, bannari_logo);
+
+  // Fill any remaining rows below the logo with black
+  if (draw_h < 128) {
+    tft_fill_rect(0, draw_h, 160, 128 - draw_h, 0x0000);
+  }
 
   // ---- Hold for 5 seconds ----
   delay_ms(5000);
 
-  // ---- Slow FADE-OUT: top-to-bottom white curtain wipe (~900 ms) ----
-  // 60 bands x 4 px each x 15 ms = ~900 ms (covers full 240 logical rows)
+  // ---- Slow FADE-OUT: top-to-bottom white curtain wipe ----
   for (uint16_t y = 0; y < 128; y += 4) {
-    tft_fill_rect(0, y, 160, 4, 0xFFFF); // overwrite strip with white
+    tft_fill_rect(0, y, 160, 4, 0xFFFF);
     delay_ms(15);
   }
   // Final safety clear
