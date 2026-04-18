@@ -29,8 +29,30 @@
 #define PA17_IS_HIGH() ((PORT_SEC_REGS->GROUP[0].PORT_IN >> 17u) & 1u)
 
 static void delay_us(int us) {
-  for (volatile int i = 0; i < us * 10; i++)
-    ;
+  // Use exact hardware cycle counting for perfectly deterministic delays
+  if ((SysTick->CTRL & SysTick_CTRL_ENABLE_Msk) == 0) {
+    SysTick->LOAD = 0xFFFFFF;
+    SysTick->VAL = 0;
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_ENABLE_Msk;
+  }
+
+  uint32_t ticks = (uint32_t)us * (CPU_CLOCK_FREQUENCY / 1000000);
+  uint32_t reload = SysTick->LOAD;
+  if (reload == 0)
+    reload = 0xFFFFFF;
+
+  uint32_t start = SysTick->VAL;
+  uint32_t elapsed = 0;
+
+  while (elapsed < ticks) {
+    uint32_t current = SysTick->VAL;
+    if (start >= current) {
+      elapsed += (start - current);
+    } else {
+      elapsed += (start + reload + 1 - current);
+    }
+    start = current;
+  }
 }
 
 static bool check_button_toggle(void);
@@ -117,6 +139,42 @@ static uint16_t read_adc_avg(uint8_t channel) {
   // If we just switched to a new sensor, the internal ADC capacitor needs time
   // to charge to the new voltage, especially for high-impedance gas sensors!
   if (channel != last_channel) {
+    uint8_t pin = 0xFF;
+    if (channel == 0)
+      pin = 2; // PA02 - Dust
+    else if (channel == 2)
+      pin = 4; // PA04 - CO2
+    else if (channel == 3)
+      pin = 5; // PA05 - MQ131
+    else if (channel == 4)
+      pin = 6; // PA06 - MQ7
+    else if (channel == 5)
+      pin = 7; // PA07 - MQ135
+
+    if (pin != 0xFF) {
+      // Temporarily disable analog PMUX and enable digital pull-down
+      // to drain any ghost charge if the sensor is floating/disconnected.
+      PORT_SEC_REGS->GROUP[0].PORT_PINCFG[pin] &= ~PORT_PINCFG_PMUXEN_Msk;
+      PORT_REGS->GROUP[0].PORT_PINCFG[pin] &= ~PORT_PINCFG_PMUXEN_Msk;
+
+      PORT_SEC_REGS->GROUP[0].PORT_DIRCLR = (1U << pin);
+      PORT_REGS->GROUP[0].PORT_DIRCLR = (1U << pin);
+
+      PORT_SEC_REGS->GROUP[0].PORT_OUTCLR = (1U << pin);
+      PORT_REGS->GROUP[0].PORT_OUTCLR = (1U << pin);
+
+      PORT_SEC_REGS->GROUP[0].PORT_PINCFG[pin] |= PORT_PINCFG_PULLEN_Msk;
+      PORT_REGS->GROUP[0].PORT_PINCFG[pin] |= PORT_PINCFG_PULLEN_Msk;
+
+      delay_us(100); // Bleed OFF stray floating voltage
+
+      PORT_SEC_REGS->GROUP[0].PORT_PINCFG[pin] &= ~PORT_PINCFG_PULLEN_Msk;
+      PORT_REGS->GROUP[0].PORT_PINCFG[pin] &= ~PORT_PINCFG_PULLEN_Msk;
+
+      PORT_SEC_REGS->GROUP[0].PORT_PINCFG[pin] |= PORT_PINCFG_PMUXEN_Msk;
+      PORT_REGS->GROUP[0].PORT_PINCFG[pin] |= PORT_PINCFG_PMUXEN_Msk;
+    }
+
     delay_us(200); // Allow physical voltage to settle through the multiplexer
 
     // Perform one dummy conversion to flush the ADC pipeline/capacitor
@@ -185,6 +243,9 @@ static float read_dust() {
   }
 
   float voltage = sum / 5.0f;
+  if (voltage < 0.15f)
+    return 0.0f; // Sensor removed/no input
+
   static float baseline = 0;
   if (baseline == 0)
     baseline = voltage;
@@ -201,6 +262,8 @@ static float read_dust() {
 static float read_mg811_co2() {
   uint16_t adc = read_adc_avg(2); // PA04 is AIN2
   float voltage = adc_to_voltage(adc);
+  if (voltage < 0.15f)
+    return 0.0f; // Sensor removed/no input
   float co2 = 400.0f + voltage * 500.0f;
   if (co2 < 400.0f)
     co2 = 400.0f;
@@ -211,13 +274,154 @@ static float read_mg811_co2() {
 
 // ======================== DELAY =============================
 static void delay_ms(uint32_t ms) {
-  for (uint32_t i = 0; i < ms; i++)
-    for (volatile uint32_t j = 0; j < 12000UL; j++)
-      ;
+  for (uint32_t i = 0; i < ms; i++) {
+    delay_us(1000); // 1000 us = 1 ms precision hardware delay
+  }
 }
 
+// ======================== DHT11 SENSOR ======================
+// PA14 = Data pin (single-wire, open-drain protocol)
+// DHT11 protocol timing (from datasheet):
+//   Host start: pull LOW >18ms, then release (float input)
+//   Sensor response: 80us LOW, then 80us HIGH
+//   Each data bit: 50us LOW then HIGH (26-28us = '0', 70us = '1')
+//   Checksum: byte[4] = byte[0]+[1]+[2]+[3]
+//
+// IMPORTANT: Read no more than once every 2 seconds or sensor won't respond.
+// We use a simple PIN read macro that checks BOTH Secure and Non-Secure
+// PORT_IN registers – the one in the correct TrustZone state will be valid.
+#define DHT_PIN 14U
+#define DHT_READ_PIN()                                                         \
+  (((PORT_SEC_REGS->GROUP[0].PORT_IN >> DHT_PIN) & 1U) |                       \
+   ((PORT_REGS->GROUP[0].PORT_IN >> DHT_PIN) & 1U))
+
+// Set PA14 as OUTPUT, drive it to 'val' (0=low, 1=high)
+#define DHT_SET_OUTPUT(val)                                                    \
+  do {                                                                         \
+    PORT_SEC_REGS->GROUP[0].PORT_PINCFG[DHT_PIN] = 0x00U;                      \
+    PORT_REGS->GROUP[0].PORT_PINCFG[DHT_PIN] = 0x00U;                          \
+    PORT_SEC_REGS->GROUP[0].PORT_DIRSET = (1U << DHT_PIN);                     \
+    PORT_REGS->GROUP[0].PORT_DIRSET = (1U << DHT_PIN);                         \
+    if (val) {                                                                 \
+      PORT_SEC_REGS->GROUP[0].PORT_OUTSET = (1U << DHT_PIN);                   \
+      PORT_REGS->GROUP[0].PORT_OUTSET = (1U << DHT_PIN);                       \
+    } else {                                                                   \
+      PORT_SEC_REGS->GROUP[0].PORT_OUTCLR = (1U << DHT_PIN);                   \
+      PORT_REGS->GROUP[0].PORT_OUTCLR = (1U << DHT_PIN);                       \
+    }                                                                          \
+  } while (0)
+
+// Float PA14 as INPUT (INEN=1, no PULLEN) – critical: no pull-up fight during
+// active-LOW response from sensor
+#define DHT_SET_INPUT_FLOAT()                                                  \
+  do {                                                                         \
+    PORT_SEC_REGS->GROUP[0].PORT_DIRCLR = (1U << DHT_PIN);                     \
+    PORT_REGS->GROUP[0].PORT_DIRCLR = (1U << DHT_PIN);                         \
+    PORT_SEC_REGS->GROUP[0].PORT_PINCFG[DHT_PIN] = 0x02U; /* INEN=1 only */    \
+    PORT_REGS->GROUP[0].PORT_PINCFG[DHT_PIN] = 0x02U;                          \
+  } while (0)
+
+static uint32_t expectPulse(bool level) {
+  uint32_t count = 0;
+  uint32_t max_cycles = 100000; // Large timeout
+  while (DHT_READ_PIN() == (level ? 1U : 0U)) {
+    if (count++ >= max_cycles) {
+      return 0; // Exceeded timeout, fail.
+    }
+  }
+  return count;
+}
+
+static bool read_dht11(float *temp, float *hum) {
+  uint32_t cycles[80];
+
+  // 1. Host sends START signal (pull low for 20ms)
+  DHT_SET_OUTPUT(0);
+  delay_ms(20);
+
+  // 2. Host releases line to float (external 10k resistor pulls it HIGH).
+  // Then we wait 55us. The DHT11 takes 20-40us to respond by pulling LOW.
+  // So after 55us, the line WILL definitively be LOW.
+  DHT_SET_INPUT_FLOAT();
+  delay_us(55);
+
+  // CRITICAL SECTION: Disable all interrupts!
+  // If a UART or SysTick interrupt fires during these microseconds,
+  // it throws off the cycle counting completely and we lose the sensor edge.
+  __disable_irq();
+
+  // 3. Sensor holds LOW for ~80us. Since we delayed 55us, it has already
+  // been LOW for a bit. Wait while it finishes this LOW pulse.
+  if (expectPulse(false) == 0) {
+    __enable_irq();
+    P("[DHT] Err: Timeout waiting for start signal LOW pulse\r\n");
+    return false;
+  }
+
+  // 4. Sensor holds HIGH for ~80us. Wait until it goes LOW.
+  if (expectPulse(true) == 0) {
+    __enable_irq();
+    P("[DHT] Err: Timeout waiting for start signal HIGH pulse\r\n");
+    return false;
+  }
+
+  // 5. Read the 40 bits
+  for (int i = 0; i < 80; i += 2) {
+    cycles[i] = expectPulse(false);    // LOW pulse
+    cycles[i + 1] = expectPulse(true); // HIGH pulse
+  }
+
+  // Re-enable interrupts immediately after the fast bit-stream.
+  __enable_irq();
+
+  uint8_t data[5] = {0, 0, 0, 0, 0};
+  for (int i = 0; i < 40; ++i) {
+    uint32_t lowCycles = cycles[2 * i];
+    uint32_t highCycles = cycles[2 * i + 1];
+
+    if ((lowCycles == 0) || (highCycles == 0)) {
+      char dbuf[80];
+      sprintf(dbuf, "[DHT] Err: Bits missing at bit %d (L:%lu H:%lu)\r\n", i,
+              lowCycles, highCycles);
+      while (SERCOM3_USART_WriteIsBusy())
+        ;
+      SERCOM3_USART_Write((uint8_t *)dbuf, strlen(dbuf));
+      return false;
+    }
+
+    data[i / 8] <<= 1;
+    // Adafruit logic: if high cycle count > low cycle count, it's a 1!
+    if (highCycles > lowCycles) {
+      data[i / 8] |= 1;
+    }
+  }
+
+  // 7. Checksum
+  if (data[4] == ((data[0] + data[1] + data[2] + data[3]) & 0xFF)) {
+    // Calculate final float values incorporating the decimal bytes!
+    // Per DHT11/DHT22 hybrid datasheets, bits[1] and bits[3] contain the
+    // decimal portions.
+    *hum = (float)data[0] + ((float)data[1] * 0.1f);
+    *temp = (float)data[2] + ((float)data[3] * 0.1f);
+    return true;
+  } else {
+    char dbuf[80];
+    sprintf(dbuf, "[DHT] CRC fail: %d+%d+%d+%d=%d, got %d\r\n", data[0],
+            data[1], data[2], data[3],
+            ((data[0] + data[1] + data[2] + data[3]) & 0xFF), data[4]);
+    while (SERCOM3_USART_WriteIsBusy())
+      ;
+    SERCOM3_USART_Write((uint8_t *)dbuf, strlen(dbuf));
+    return false;
+  }
+}
+#undef DHT_PIN
+#undef DHT_READ_PIN
+#undef DHT_SET_OUTPUT
+#undef DHT_SET_INPUT_FLOAT
+
 // ======================== GPIO HELPERS ======================
-// Software Bit-Banged SPI ÃƒÆ’Ã‚Â¢?? Bypasses all SERCOM and TrustZone issues.
+// Software Bit-Banged SPI – Bypasses all SERCOM and TrustZone issues.
 // MOSI = PA08, SCK = PA09
 
 // TRUSTZONE-PROOF GPIO MACROS:
@@ -768,13 +972,13 @@ static void tft_draw_bitmap_region(uint8_t dest_x, uint8_t dest_y,
 }
 
 // ======================== CIRCLE DRAW ========================
-// Bresenham midpoint circle ÃƒÆ’Ã‚Â¢?? filled
+// Bresenham midpoint circle – filled
 static void tft_fill_circle(uint8_t cx, uint8_t cy, uint8_t r, uint16_t color) {
   int16_t x = 0, y = (int16_t)r, d = 1 - (int16_t)r;
   while (x <= y) {
     // Draw horizontal spans for each octant pair
     int16_t x0, x1, ys;
-    // span at ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±y rows
+    // span at ±y rows
     ys = (int16_t)cy - y;
     if (ys >= 0) {
       x0 = (int16_t)cx - x;
@@ -799,7 +1003,7 @@ static void tft_fill_circle(uint8_t cx, uint8_t cy, uint8_t r, uint16_t color) {
         tft_fill_rect((uint8_t)x0, (uint8_t)ys, (uint8_t)(x1 - x0 + 1), 1,
                       color);
     }
-    // span at ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±x rows
+    // span at ±x rows
     ys = (int16_t)cy - x;
     if (ys >= 0) {
       x0 = (int16_t)cx - y;
@@ -1038,10 +1242,10 @@ static void draw_bottom_wave(uint16_t active_color, uint8_t wt,
 }
 
 // ============================================================
-// PAGE 1 â€“ Logo Splash
+// PAGE 1 – Logo Splash
 // Renders the exact bitmap from logo.h (bannari_logo, 160x128)
 // which contains the pre-rendered Microchip + Bannari Amman logos.
-// Holds for 5 seconds then fades out with a topâ†’bottom white wipe.
+// Holds for 5 seconds then fades out with a top→bottom white wipe.
 // ============================================================
 static void draw_logo_page(void) {
   // ---- Display the exact combined logo bitmap (full screen 160x128) ----
@@ -1051,7 +1255,7 @@ static void draw_logo_page(void) {
   delay_ms(5000);
 
   // ---- Slow FADE-OUT: top-to-bottom white curtain wipe (~900 ms) ----
-  // 32 bands Ã— 4 px each Ã— 28 ms delay = ~896 ms
+  // 32 bands × 4 px each × 28 ms delay = ~896 ms
   for (uint8_t y = 0; y < 128; y += 4) {
     tft_fill_rect(0, y, 160, 4, 0xFFFF); // overwrite strip with white
     delay_ms(28);
@@ -1070,25 +1274,37 @@ static void read_all_sensors(float *ppm_o3, float *ppm_co, float *ppm_nh3,
   float R0_MQ135 = 20000.0f;
 
   float v1 = adc_to_voltage(read_adc_avg(3));
-  *ppm_o3 = pow(10, ((log10(calculate_Rs(v1) / R0_MQ131) - 0.8f) / -0.7f));
-  if (*ppm_o3 > 9999.0f)
-    *ppm_o3 = 9999.0f;
-  if (*ppm_o3 < 0.0f)
+  if (v1 < 0.15f) {
     *ppm_o3 = 0.0f;
+  } else {
+    *ppm_o3 = pow(10, ((log10(calculate_Rs(v1) / R0_MQ131) - 0.8f) / -0.7f));
+    if (*ppm_o3 > 9999.0f)
+      *ppm_o3 = 9999.0f;
+    if (*ppm_o3 < 0.0f)
+      *ppm_o3 = 0.0f;
+  }
 
   float v2 = adc_to_voltage(read_adc_avg(4));
-  *ppm_co = pow(10, ((log10(calculate_Rs(v2) / R0_MQ7) - 0.77f) / -0.47f));
-  if (*ppm_co > 9999.0f)
-    *ppm_co = 9999.0f;
-  if (*ppm_co < 0.0f)
+  if (v2 < 0.15f) {
     *ppm_co = 0.0f;
+  } else {
+    *ppm_co = pow(10, ((log10(calculate_Rs(v2) / R0_MQ7) - 0.77f) / -0.47f));
+    if (*ppm_co > 9999.0f)
+      *ppm_co = 9999.0f;
+    if (*ppm_co < 0.0f)
+      *ppm_co = 0.0f;
+  }
 
   float v3 = adc_to_voltage(read_adc_avg(5));
-  *ppm_nh3 = pow(10, ((log10(calculate_Rs(v3) / R0_MQ135) - 0.42f) / -0.48f));
-  if (*ppm_nh3 > 9999.0f)
-    *ppm_nh3 = 9999.0f;
-  if (*ppm_nh3 < 0.0f)
+  if (v3 < 0.15f) {
     *ppm_nh3 = 0.0f;
+  } else {
+    *ppm_nh3 = pow(10, ((log10(calculate_Rs(v3) / R0_MQ135) - 0.42f) / -0.48f));
+    if (*ppm_nh3 > 9999.0f)
+      *ppm_nh3 = 9999.0f;
+    if (*ppm_nh3 < 0.0f)
+      *ppm_nh3 = 0.0f;
+  }
 
   *pm25 = read_dust();
   *co2 = read_mg811_co2();
@@ -1096,10 +1312,10 @@ static void read_all_sensors(float *ppm_o3, float *ppm_co, float *ppm_nh3,
 
 // ============================================================
 // AQI EPA breakpoint linear interpolation
-// Returns the AQI sub-index for a given pollutant concentration.
-// ============================================================
-static int aqi_linear(int lo, int hi, float clo, float chi, float c) {
-  return (int)(((float)(hi - lo) / (chi - clo)) * (c - clo) + (float)lo);
+// Formula: Ip = [(I_Hi - I_Lo) / (BP_Hi - BP_Lo)] * (C_p - BP_Lo) + I_Lo
+static int aqi_linear(int I_Lo, int I_Hi, float BP_Lo, float BP_Hi, float C_p) {
+  return (int)(((float)(I_Hi - I_Lo) / (BP_Hi - BP_Lo)) * (C_p - BP_Lo) +
+               (float)I_Lo);
 }
 
 static int aqi_from_pm25(float c) {
@@ -1154,17 +1370,38 @@ static int aqi_from_o3(float c) { // c in ppb (1-hr standard)
   return 301;
 }
 
-// Calculates combined AQI using US EPA method: max of all sub-indices.
+static int aqi_from_nh3(float c) { // c in ug/m3
+  if (c < 0.0f)
+    c = 0.0f;
+  if (c <= 200.0f)
+    return aqi_linear(0, 50, 0.0f, 200.0f, c);
+  if (c <= 400.0f)
+    return aqi_linear(51, 100, 201.0f, 400.0f, c);
+  if (c <= 800.0f)
+    return aqi_linear(101, 200, 401.0f, 800.0f, c);
+  if (c <= 1200.0f)
+    return aqi_linear(201, 300, 801.0f, 1200.0f, c);
+  if (c <= 1800.0f)
+    return aqi_linear(301, 400, 1201.0f, 1800.0f, c);
+  if (c <= 2800.0f)
+    return aqi_linear(401, 500, 1801.0f, 2800.0f, c);
+  return 500;
+}
+
+// Calculates combined AQI using max of all sub-indices.
 static int calculate_real_aqi(void) {
   float o3, co, nh3, dust, co2;
   read_all_sensors(&o3, &co, &nh3, &dust, &co2);
   int a_pm = aqi_from_pm25(dust);
   int a_co = aqi_from_co(co);
   int a_o3 = aqi_from_o3(o3);
+  int a_nh3 = aqi_from_nh3(nh3);
   // Take the worst (highest) sub-index as overall AQI
   int aqi = a_pm;
   if (a_co > aqi)
     aqi = a_co;
+  if (a_nh3 > aqi)
+    aqi = a_nh3;
   if (a_o3 > aqi)
     aqi = a_o3;
   if (aqi > 500)
@@ -1174,8 +1411,75 @@ static int calculate_real_aqi(void) {
   return aqi;
 }
 
+static void update_background_sensors(int *out_aqi, float *out_o3,
+                                      float *out_co, float *out_nh3,
+                                      float *out_dust, float *out_co2,
+                                      float *out_t, float *out_h) {
+  float o3, co, nh3, dust, co2;
+  read_all_sensors(&o3, &co, &nh3, &dust, &co2);
+
+  int a_pm = aqi_from_pm25(dust);
+  int a_co = aqi_from_co(co);
+  int a_o3 = aqi_from_o3(o3);
+  int a_nh3 = aqi_from_nh3(nh3);
+  int new_aqi = a_pm;
+  if (a_co > new_aqi)
+    new_aqi = a_co;
+  if (a_nh3 > new_aqi)
+    new_aqi = a_nh3;
+  if (a_o3 > new_aqi)
+    new_aqi = a_o3;
+  if (new_aqi > 500)
+    new_aqi = 500;
+  if (new_aqi < 0)
+    new_aqi = 0;
+
+  static int dht_tick = 50;
+  static float last_t = -1.0f, last_h = -1.0f;
+
+  if (++dht_tick > 50) {
+    dht_tick = 0;
+    float t = 0, h = 0;
+    if (read_dht11(&t, &h)) {
+      last_t = t;
+      last_h = h;
+      char dht_ok[48];
+      sprintf(dht_ok, "[DHT] OK Temp:%.1fC Hum:%.1f%%\r\n", t, h);
+      while (SERCOM3_USART_WriteIsBusy())
+        ;
+      SERCOM3_USART_Write((uint8_t *)dht_ok, strlen(dht_ok));
+    }
+  }
+
+  char tbuf[250];
+  sprintf(tbuf,
+          "O3:%.1f CO:%.1f NH3:%.1f Dust:%.1f CO2:%.1f AQI:%d Temp:%.1fC "
+          "Hum:%.1f%%\r\n",
+          o3, co, nh3, dust, co2, new_aqi, last_t, last_h);
+  while (SERCOM3_USART_WriteIsBusy())
+    ;
+  SERCOM3_USART_Write((uint8_t *)tbuf, strlen(tbuf));
+
+  if (out_aqi)
+    *out_aqi = new_aqi;
+  if (out_o3)
+    *out_o3 = o3;
+  if (out_co)
+    *out_co = co;
+  if (out_nh3)
+    *out_nh3 = nh3;
+  if (out_dust)
+    *out_dust = dust;
+  if (out_co2)
+    *out_co2 = co2;
+  if (out_t)
+    *out_t = last_t;
+  if (out_h)
+    *out_h = last_h;
+}
+
 // ============================================================
-// PAGE 2 â€“ AQI Default display
+// PAGE 2 – AQI Default display
 // Shows wave gauge, AQI number, live location, status label.
 // Returns when PA17 goes HIGH (switch to sensor page).
 // ============================================================
@@ -1283,33 +1587,10 @@ static void run_aqi_page(int *saved_aqi, int *saved_target) {
       tft_draw_string(80 - (w * 12) / 2, 102, label, active_color, bg, 2);
     }
 
-    // ---- Read sensors every loop tick â€“ continuous serial + AQI update ----
+    // ---- Read sensors every loop tick – continuous serial + AQI update ----
     {
-      float o3, co, nh3, dust, co2;
-      read_all_sensors(&o3, &co, &nh3, &dust, &co2);
-
-      // Compute real AQI from the same readings (no second ADC read)
-      int a_pm = aqi_from_pm25(dust);
-      int a_co = aqi_from_co(co);
-      int a_o3 = aqi_from_o3(o3);
-      int new_aqi = a_pm;
-      if (a_co > new_aqi)
-        new_aqi = a_co;
-      if (a_o3 > new_aqi)
-        new_aqi = a_o3;
-      if (new_aqi > 500)
-        new_aqi = 500;
-      if (new_aqi < 0)
-        new_aqi = 0;
-      target_aqi = new_aqi;
-
-      // UART â€“ sent every loop (as fast as ADC sampling allows)
-      char tbuf[200];
-      sprintf(tbuf, "O3:%.1f CO:%.1f NH3:%.1f Dust:%.1f CO2:%.1f AQI:%d\r\n",
-              o3, co, nh3, dust, co2, target_aqi);
-      while (SERCOM3_USART_WriteIsBusy())
-        ;
-      SERCOM3_USART_Write((uint8_t *)tbuf, strlen(tbuf));
+      update_background_sensors(&target_aqi, NULL, NULL, NULL, NULL, NULL, NULL,
+                                NULL);
     }
   }
 }
@@ -1406,22 +1687,9 @@ static void run_sensor_page(void) {
 
     // ---- Update sensor values continuously ----
     {
-      float o3, co, nh3, dust, co2;
-      read_all_sensors(&o3, &co, &nh3, &dust, &co2);
-
-      // Compute AQI
-      int a_pm = aqi_from_pm25(dust);
-      int a_co = aqi_from_co(co);
-      int a_o3 = aqi_from_o3(o3);
-      int new_aqi = a_pm;
-      if (a_co > new_aqi)
-        new_aqi = a_co;
-      if (a_o3 > new_aqi)
-        new_aqi = a_o3;
-      if (new_aqi > 500)
-        new_aqi = 500;
-      if (new_aqi < 0)
-        new_aqi = 0;
+      float o3, co, nh3, dust, co2, t, h;
+      int new_aqi;
+      update_background_sensors(&new_aqi, &o3, &co, &nh3, &dust, &co2, &t, &h);
 
       // Update the TFT at a slower 10-15Hz rate to prevent screen
       // tearing/flicker
@@ -1447,20 +1715,208 @@ static void run_sensor_page(void) {
         sprintf(vbuf, "%d", new_aqi);
         update_card_value(82, 88, vbuf, "idx");
       }
-
-      // UART mirror (Continuous)
-      char tbuf[160];
-      sprintf(tbuf, "O3:%.1f CO:%.1f NH3:%.1f Dust:%.1f CO2:%.1f AQI:%d\r\n",
-              o3, co, nh3, dust, co2, new_aqi);
-      while (SERCOM3_USART_WriteIsBusy())
-        ;
-      SERCOM3_USART_Write((uint8_t *)tbuf, strlen(tbuf));
     }
   }
 }
 
 // ============================================================
-// Top-level display controller – orchestrates all 3 pages
+static void draw_thermometer(uint8_t x, uint8_t y, uint16_t color, uint16_t inner_c) {
+  tft_fill_circle(x + 5, y + 12, 4, color);
+  tft_fill_rect(x + 3, y, 5, 10, color);
+  tft_fill_circle(x + 5, y + 12, 2, inner_c);
+  tft_fill_rect(x + 4, y + 1, 3, 9, inner_c);
+  tft_fill_circle(x + 5, y + 12, 1, color);
+  tft_fill_rect(x + 4, y + 6, 3, 6, color);
+  tft_fill_rect(x + 10, y + 2, 3, 1, color);
+  tft_fill_rect(x + 10, y + 5, 2, 1, color);
+  tft_fill_rect(x + 10, y + 8, 3, 1, color);
+}
+
+static void draw_water_drop(uint8_t x, uint8_t y, uint16_t color, uint16_t inner_c) {
+  tft_fill_circle(x + 6, y + 10, 5, color);
+  for(int i=0; i<5; i++) {
+    tft_fill_rect(x + 6 - i, y + 9 - i - 2, (i*2) + 1, 1, color);
+  }
+  tft_fill_circle(x + 6, y + 11, 2, inner_c);
+}
+
+static void run_dht_page(void) {
+  uint16_t bg = 0xF7DF; // Very light blue
+  uint16_t card_bg = 0xFFFF; // White
+  uint16_t title_c = 0x18E3; // Dark blue
+  
+  tft_fill_screen(bg);
+  tft_draw_string(5, 5, "< Temperature & humidity", title_c, bg, 1);
+
+  // Shelf
+  tft_fill_rect(106, 110, 54, 18, 0xD6BA); // Shelf top
+  
+  // Plant Stems
+  tft_fill_rect(130, 50, 2, 60, 0x7BEF); 
+  tft_fill_rect(142, 60, 1, 50, 0x7BEF);
+
+  // Leaves
+  tft_fill_circle(126, 45, 12, 0x9E73); 
+  tft_fill_circle(148, 40, 9, 0x5D2D);
+  tft_fill_circle(145, 65, 7, 0x9E73);
+  tft_fill_circle(123, 75, 6, 0x5D2D);
+  
+  // Pot
+  tft_fill_rect(125, 95, 18, 15, 0xFFFF); 
+  tft_fill_rect(122, 93, 24, 3, 0xFFFF);   
+
+  // Little squarish sensor box
+  tft_fill_rect(108, 85, 20, 25, 0xBDB6); 
+  tft_fill_rect(110, 87, 16, 21, 0xCE59); 
+  draw_thermometer(110, 90, 0xFFFF, 0xCE59);
+
+  // Cards Base
+  tft_fill_rect(5, 20, 100, 40, card_bg);
+  tft_fill_rect(5, 65, 100, 40, card_bg); 
+  
+  tft_draw_pixel(5, 20, bg); tft_draw_pixel(104, 20, bg);
+  tft_draw_pixel(5, 59, bg); tft_draw_pixel(104, 59, bg);
+  tft_draw_pixel(5, 65, bg); tft_draw_pixel(104, 65, bg);
+  tft_draw_pixel(5, 104, bg); tft_draw_pixel(104, 104, bg);
+
+  // Gradient bars
+  tft_fill_rect(15, 56, 30, 2, 0x64BF); // Blue bar card 1
+  tft_fill_rect(15, 101, 30, 2, 0x64BF); // Blue bar card 2
+
+  // Icons
+  draw_thermometer(10, 28, 0x64BF, 0xFFFF);
+  draw_water_drop(10, 73, 0x64BF, 0xFFFF);
+
+  float last_t = -999.0f, last_h = -999.0f;
+  
+  while (1) {
+    if (check_button_toggle()) return;
+    
+    float o3, co, nh3, dust, co2, t, h;
+    int aqi;
+    update_background_sensors(&aqi, &o3, &co, &nh3, &dust, &co2, &t, &h);
+    
+    if (t != last_t || h != last_h) {
+       last_t = t;
+       last_h = h;
+       
+       char tbuf[16];
+       char hbuf[16];
+       
+       tft_fill_rect(30, 23, 70, 18, card_bg); // text clear
+       tft_fill_rect(30, 68, 70, 18, card_bg); // text clear
+       tft_fill_rect(30, 42, 70, 10, card_bg); // subtext clear
+       tft_fill_rect(30, 87, 70, 10, card_bg); // subtext clear
+       
+       if (t < -50.0f || h < 0.0f) {
+           tft_draw_string(30, 23, "--.- C", 0x0000, card_bg, 2);
+           tft_draw_string(30, 68, "--.- %", 0x0000, card_bg, 2);
+       } else {
+           sprintf(tbuf, "%.1f", t);
+           int offset = 0;
+           for(int i=0; tbuf[i] != '\0'; i++) offset++;
+           offset *= 12;
+           tft_draw_string(30, 23, tbuf, 0x0000, card_bg, 2);
+           tft_draw_circle_outline(30 + offset + 3, 26, 2, 0x0000);
+           tft_draw_string(30 + offset + 8, 23, "C", 0x0000, card_bg, 2);
+           
+           sprintf(hbuf, "%.1f%%", h);
+           tft_draw_string(30, 68, hbuf, 0x0000, card_bg, 2);
+       }
+       
+       const char* t_txt = "Comfortable";
+       if (t > 26.0f) t_txt = "Hot";
+       else if (t < 18.0f) t_txt = "Cold";
+       if (t < -50.0f) t_txt = "Reading...";
+       
+       const char* h_txt = "Comfortable";
+       if (h > 60.0f) h_txt = "Humid";
+       else if (h < 40.0f) h_txt = "Slightly dry";
+       if (h < 0.0f) h_txt = "Reading...";
+       
+       tft_draw_string(30, 42, t_txt, 0xB5B6, card_bg, 1);
+       tft_draw_string(30, 87, h_txt, 0xB5B6, card_bg, 1);
+    }
+    
+    delay_ms(50);
+  }
+}
+
+// ============================================================
+static void run_manual_page(void) {
+  // --- Ultimate Scenic Background (Sky -> Mist -> Forest) ---
+  for (int i = 0; i < 128; i++) {
+    uint16_t c;
+    if (i < 35)
+      c = 0xDEFB; // Light Sky Blue
+    else if (i < 65)
+      c = 0xFFFF; // White Mist
+    else if (i < 95)
+      c = 0xE73F; // Soft Cloud Green
+    else
+      c = 0x8621; // Darker Forest Green
+    tft_fill_rect(0, i, 160, 1, c);
+  }
+
+  uint16_t txt_bg = 0xFFFF; // Use mist area for text contrast
+
+  // --- Header: EdgeAQI + Leaf Logo ---
+  tft_fill_circle(38, 12, 5, 0x1B20);   // Dark Green leaf body
+  tft_fill_rect(34, 12, 10, 1, 0xFFFF); // leaf vein
+  tft_draw_string(52, 10, "EdgeAQI", 0x1B20, 0xDEFB, 2);
+
+  tft_draw_string(30, 28, "AIR QUALITY MONITORING SYSTEM", 0x52AA, 0xDEFB, 1);
+  tft_draw_string(55, 42, "USER MANUAL", 0x0000, 0xFFFF, 1);
+  tft_fill_rect(55, 52, 60, 1, 0x0000); // Underline for title
+
+  // --- The Slanted AQI Bar ---
+  // Matches photo exactly: 6 slanted segments, white dividers
+  int sw = 25, sh = 30, sy = 58, slant = 10;
+  uint16_t cols[] = {0x0320, 0x4CC0, 0xFE60, 0xFBC0, 0xD800, 0x8000};
+  const char *tLabels[] = {"0-50",    "51-100",  "101-200",
+                           "201-300", "301-400", "401-500"};
+  const char *bLabels[] = {"Good", "Moderate",  "101-200",
+                           "Poor", "Very Poor", "Hazardous"};
+
+  for (int s = 0; s < 6; s++) {
+    int sx = 4 + s * sw;
+    for (int i = 0; i < sh; i++) {
+      int off = slant - (slant * i / sh);
+      tft_fill_rect(sx + off, sy + i, sw, 1, cols[s]);
+      if (s > 0)
+        tft_draw_pixel(sx + off, sy + i, 0xFFFF); // white separator
+    }
+    // Top label: AQI range number
+    tft_draw_string(sx + 5 + (slant / 2), sy + 4, tLabels[s], 0xFFFF, cols[s],
+                    1);
+    // Bottom label: category name
+    tft_draw_string(sx + 2 + (slant / 4), sy + 18, bLabels[s], 0xFFFF, cols[s],
+                    1);
+  }
+
+  // --- Bottom Gradient Scale (matches photo exactly) ---
+  tft_draw_string(2, 105, "GOOD TO MODERATE", 0x1B20, 0xE73F, 1);
+  for (int i = 0; i < 60; i++) {
+    uint16_t gc = (i < 20) ? 0x0400 : (i < 40) ? 0xFDA0 : 0xF800;
+    tft_fill_rect(95 + i / 2, 108, 1, 2, gc);
+  }
+  tft_draw_string(100, 105, "POOR TO HAZARDOUS", 0x8000, 0xE73F, 1);
+
+  while (1) {
+    if (check_button_toggle()) {
+      return;
+    }
+    // Update sensors and spam output to Putty!
+    // Add a 50ms delay so this loop matches the approximate speed of the other
+    // pages, ensuring the DHT isn't polled faster than its 2-second crash
+    // threshold.
+    update_background_sensors(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    delay_ms(50);
+  }
+}
+
+// ============================================================
+// Top-level display controller – orchestrates all pages
 // ============================================================
 static void run_display(void) {
   // Page 1 – Logo splash (one-shot, untouched)
@@ -1476,10 +1932,16 @@ static void run_display(void) {
       count = 1;
     } else if (count == 1) {
       run_sensor_page();
-      count++;
+      count = 2;
+    } else if (count == 2) {
+      run_dht_page();
+      count = 3;
+    } else if (count == 3) {
+      run_manual_page();
+      count = 4;
     }
 
-    if (count >= 2) {
+    if (count > 3) {
       count = 0; // Reset the count
     }
   }
