@@ -1,8 +1,8 @@
 // ============================================================
-// main.c ÃƒÆ’Ã‚Â¢?? Display "Hello" on ST7735 1.8" TFT (128x160)
+// main.c �?�?�?�??�?�??�?¢?? Display "Hello" on ST7735 1.8" TFT (128x160)
 //          PIC32CM5164LS00048 @ 48 MHz  (SERCOM1 SPI)
 //
-// FULLY SELF-CONTAINED ÃƒÆ’Ã‚Â¢?? no external ST7735 library needed.
+// FULLY SELF-CONTAINED �?�?�?�??�?�??�?¢?? no external ST7735 library needed.
 //
 // Pin wiring:
 //   SDA (MOSI)  -> PA08  (SERCOM1 PAD[0])
@@ -25,7 +25,8 @@
 
 // TrustZone Native Register Aliases (using standard addressing)
 
-// PA17 button helper – reads bit 17 of PORT GROUP[0] IN register (Secure alias)
+// PA17 button helper �?? reads bit 17 of PORT GROUP[0] IN register (Secure
+// alias)
 #define PA17_IS_HIGH() ((PORT_SEC_REGS->GROUP[0].PORT_IN >> 17u) & 1u)
 
 static void delay_us(int us) {
@@ -289,7 +290,7 @@ static void delay_ms(uint32_t ms) {
 //
 // IMPORTANT: Read no more than once every 2 seconds or sensor won't respond.
 // We use a simple PIN read macro that checks BOTH Secure and Non-Secure
-// PORT_IN registers – the one in the correct TrustZone state will be valid.
+// PORT_IN registers �?? the one in the correct TrustZone state will be valid.
 #define DHT_PIN 14U
 #define DHT_READ_PIN()                                                         \
   (((PORT_SEC_REGS->GROUP[0].PORT_IN >> DHT_PIN) & 1U) |                       \
@@ -311,7 +312,7 @@ static void delay_ms(uint32_t ms) {
     }                                                                          \
   } while (0)
 
-// Float PA14 as INPUT (INEN=1, no PULLEN) – critical: no pull-up fight during
+// Float PA14 as INPUT (INEN=1, no PULLEN) �?? critical: no pull-up fight during
 // active-LOW response from sensor
 #define DHT_SET_INPUT_FLOAT()                                                  \
   do {                                                                         \
@@ -421,7 +422,7 @@ static bool read_dht11(float *temp, float *hum) {
 #undef DHT_SET_INPUT_FLOAT
 
 // ======================== GPIO HELPERS ======================
-// Software Bit-Banged SPI – Bypasses all SERCOM and TrustZone issues.
+// Software Bit-Banged SPI �?? Bypasses all SERCOM and TrustZone issues.
 // MOSI = PA08, SCK = PA09
 
 // TRUSTZONE-PROOF GPIO MACROS:
@@ -579,151 +580,186 @@ static void tft_reset(void) {
 
 static void tft_init(void) {
   // -------------------------------------------------------------
-  // ILI9341 2.5" 320x240 – Full initialization sequence
+  // EXACT PORT from Github: ArmstrongSubero/PIC32-Projects ST7735
   // -------------------------------------------------------------
   TFT_RST_HIGH();
-  delay_ms(5);
+  delay_ms(1); // 500us
   TFT_RST_LOW();
-  delay_ms(20);
+  delay_ms(1); // 500us
   TFT_RST_HIGH();
-  delay_ms(150);
+  delay_ms(1); // 500us
 
   TFT_CS_LOW();
 
-  tft_write_cmd(0x01); // SWRESET
+  tft_write_cmd(ST7735_SWRESET); // software reset
   delay_ms(150);
 
-  tft_write_cmd(0x11); // SLPOUT
-  delay_ms(150);
+  tft_write_cmd(ST7735_SLPOUT); // out of sleep mode
+  delay_ms(500);
 
-  // Power control A
-  tft_write_cmd(0xCB);
-  tft_write_data(0x39); tft_write_data(0x2C); tft_write_data(0x00);
-  tft_write_data(0x34); tft_write_data(0x02);
+  tft_write_cmd(ST7735_COLMOD); // set color mode
+  tft_write_data(0x05);         // 16-bit color
+  delay_ms(1);                  // 10us
 
-  // Power control B
-  tft_write_cmd(0xCF);
-  tft_write_data(0x00); tft_write_data(0xC1); tft_write_data(0x30);
+  tft_write_cmd(ST7735_FRMCTR1); // frame rate control - normal mode
+  tft_write_data(0x01); // frame rate = fosc / (1 x 2 + 40) * (LINE + 2C + 2D)
+  tft_write_data(0x2C);
+  tft_write_data(0x2D);
 
-  // Driver timing control A
-  tft_write_cmd(0xE8);
-  tft_write_data(0x85); tft_write_data(0x00); tft_write_data(0x78);
+  tft_write_cmd(ST7735_FRMCTR2); // frame rate control - idle mode
+  tft_write_data(0x01);
+  tft_write_data(0x2C);
+  tft_write_data(0x2D);
 
-  // Driver timing control B
-  tft_write_cmd(0xEA);
-  tft_write_data(0x00); tft_write_data(0x00);
+  tft_write_cmd(ST7735_FRMCTR3); // frame rate control - partial mode
+  tft_write_data(0x01);          // dot inversion mode
+  tft_write_data(0x2C);
+  tft_write_data(0x2D);
+  tft_write_data(0x01); // line inversion mode
+  tft_write_data(0x2C);
+  tft_write_data(0x2D);
 
-  // Power on sequence control
-  tft_write_cmd(0xED);
-  tft_write_data(0x64); tft_write_data(0x03);
-  tft_write_data(0x12); tft_write_data(0x81);
+  tft_write_cmd(ST7735_INVCTR); // display inversion control
+  tft_write_data(0x07);         // no inversion
 
-  // Pump ratio control
-  tft_write_cmd(0xF7); tft_write_data(0x20);
+  tft_write_cmd(ST7735_PWCTR1); // power control
+  tft_write_data(0xA2);
+  tft_write_data(0x02); // -4.6V
+  tft_write_data(0x84); // AUTO mode
 
-  // Power Control 1
-  tft_write_cmd(0xC0); tft_write_data(0x23);
+  tft_write_cmd(ST7735_PWCTR2); // power control
+  tft_write_data(0xC5);         // VGH25 = 2.4C VGSEL = -10 VGH = 3 * AVDD
 
-  // Power Control 2
-  tft_write_cmd(0xC1); tft_write_data(0x10);
+  tft_write_cmd(ST7735_PWCTR3); // power control
+  tft_write_data(0x0A);         // Opamp current small
+  tft_write_data(0x00);         // Boost frequency
 
-  // VCOM Control 1
-  tft_write_cmd(0xC5);
-  tft_write_data(0x3E); tft_write_data(0x28);
+  tft_write_cmd(ST7735_PWCTR4); // power control
+  tft_write_data(0x8A);         // BCLK/2, Opamp current small & Medium low
+  tft_write_data(0x2A);
 
-  // VCOM Control 2
-  tft_write_cmd(0xC7); tft_write_data(0x86);
+  tft_write_cmd(ST7735_PWCTR5); // power control
+  tft_write_data(0x8A);
+  tft_write_data(0xEE);
 
-  // COLMOD: 16-bit color (RGB565)
-  tft_write_cmd(0x3A); tft_write_data(0x55);
+  tft_write_cmd(ST7735_VMCTR1); // power control
+  tft_write_data(0x0E);
 
-  // Frame Rate Control
-  tft_write_cmd(0xB1);
-  tft_write_data(0x00); tft_write_data(0x18);
+  tft_write_cmd(ST7735_INVOFF); // don't invert display
 
-  // Display Function Control
-  tft_write_cmd(0xB6);
-  tft_write_data(0x08); tft_write_data(0x82); tft_write_data(0x27);
+  tft_write_cmd(ST7735_MADCTL); // memory access control
+  tft_write_data(0xA0);         // Landscape: 160 wide x 128 tall
 
-  // Gamma Function Disable
-  tft_write_cmd(0xF2); tft_write_data(0x00);
+  tft_write_cmd(ST7735_COLMOD); // set color mode
+  tft_write_data(0x05);         // 16-bit color
 
-  // Gamma curve selected
-  tft_write_cmd(0x26); tft_write_data(0x01);
+  tft_write_cmd(ST7735_CASET); // column addr set (landscape: 0..159)
+  tft_write_data(0x00);
+  tft_write_data(0x00); // XSTART = 0
+  tft_write_data(0x00);
+  tft_write_data(0x9F); // XEND = 159
 
-  // Positive Gamma Correction
-  tft_write_cmd(0xE0);
-  tft_write_data(0x0F); tft_write_data(0x31); tft_write_data(0x2B);
-  tft_write_data(0x0C); tft_write_data(0x0E); tft_write_data(0x08);
-  tft_write_data(0x4E); tft_write_data(0xF1); tft_write_data(0x37);
-  tft_write_data(0x07); tft_write_data(0x10); tft_write_data(0x03);
-  tft_write_data(0x0E); tft_write_data(0x09); tft_write_data(0x00);
+  tft_write_cmd(ST7735_RASET); // row addr set (landscape: 0..127)
+  tft_write_data(0x00);
+  tft_write_data(0x00); // YSTART = 0
+  tft_write_data(0x00);
+  tft_write_data(0x7F); // YEND = 127
 
-  // Negative Gamma Correction
-  tft_write_cmd(0xE1);
-  tft_write_data(0x00); tft_write_data(0x0E); tft_write_data(0x14);
-  tft_write_data(0x03); tft_write_data(0x11); tft_write_data(0x07);
-  tft_write_data(0x31); tft_write_data(0xC1); tft_write_data(0x48);
-  tft_write_data(0x08); tft_write_data(0x0F); tft_write_data(0x0C);
-  tft_write_data(0x31); tft_write_data(0x36); tft_write_data(0x0F);
+  // Gamma Adjustments - Exact from ArmstrongSubero
+  tft_write_cmd(ST7735_GMCTRP1);
+  tft_write_data(0x0f);
+  tft_write_data(0x1a);
+  tft_write_data(0x0f);
+  tft_write_data(0x18);
+  tft_write_data(0x2f);
+  tft_write_data(0x28);
+  tft_write_data(0x20);
+  tft_write_data(0x22);
+  tft_write_data(0x1f);
+  tft_write_data(0x1b);
+  tft_write_data(0x23);
+  tft_write_data(0x37);
+  tft_write_data(0x00);
+  tft_write_data(0x07);
+  tft_write_data(0x02);
+  tft_write_data(0x10);
 
-  // MADCTL: Landscape 320x240
-  // 0x60 = MX|MV  -> scan right-to-left, row/col exchange -> correct landscape
-  // If image still mirrors, try 0xA0 (MY|MV) or 0xE0 (MY|MX|MV)
-  tft_write_cmd(0x36); tft_write_data(0x60); // MX|MV landscape (no BGR)
+  tft_write_cmd(ST7735_GMCTRN1);
+  tft_write_data(0x0f);
+  tft_write_data(0x1b);
+  tft_write_data(0x0f);
+  tft_write_data(0x17);
+  tft_write_data(0x33);
+  tft_write_data(0x2c);
+  tft_write_data(0x29);
+  tft_write_data(0x2e);
+  tft_write_data(0x30);
+  tft_write_data(0x30);
+  tft_write_data(0x39);
+  tft_write_data(0x3f);
+  tft_write_data(0x00);
+  tft_write_data(0x07);
+  tft_write_data(0x03);
+  tft_write_data(0x10);
 
-  tft_write_cmd(0x29); // DISPON
-  delay_ms(50);
+  tft_write_cmd(0xF6); // Disable ram power save mode
+  tft_write_data(0x00);
+
+  tft_write_cmd(ST7735_DISPON);
+  delay_ms(100);
+
+  tft_write_cmd(ST7735_NORON); // normal display on
+  delay_ms(10);
 
   // Return CS high
   TFT_CS_HIGH();
 }
 
 // ======================== DRAWING FUNCTIONS ==================
-static void tft_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
-  tft_write_cmd(0x2A); // CASET
-  tft_write_data(x0 >> 8);
-  tft_write_data(x0 & 0xFF);
-  tft_write_data(x1 >> 8);
-  tft_write_data(x1 & 0xFF);
+static void tft_set_window(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1) {
+  tft_write_cmd(ST7735_CASET);
+  tft_write_data(0x00);
+  tft_write_data(x0);
+  tft_write_data(0x00);
+  tft_write_data(x1);
 
-  tft_write_cmd(0x2B); // RASET
-  tft_write_data(y0 >> 8);
-  tft_write_data(y0 & 0xFF);
-  tft_write_data(y1 >> 8);
-  tft_write_data(y1 & 0xFF);
+  tft_write_cmd(ST7735_RASET);
+  tft_write_data(0x00);
+  tft_write_data(y0);
+  tft_write_data(0x00);
+  tft_write_data(y1);
 
-  tft_write_cmd(0x2C); // RAMWR
+  tft_write_cmd(ST7735_RAMWR);
 }
 
 static void tft_fill_screen(uint16_t color) {
   uint8_t hi = color >> 8;
   uint8_t lo = color & 0xFF;
 
-  // 320x240 screen limits
-  tft_set_window(0, 0, 319, 239);
+  tft_set_window(0, 0, 159, 127);
 
   TFT_DC_HIGH();
   TFT_CS_LOW();
-  for (uint32_t i = 0; i < (320UL * 240UL); i++) {
+  for (uint32_t i = 0; i < (160UL * 128UL); i++) {
     spi_send(hi);
     spi_send(lo);
   }
   TFT_CS_HIGH();
 }
 
-static void tft_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color);
-
-static void tft_draw_pixel(uint16_t x, uint16_t y, uint16_t color) {
-  tft_fill_rect(x, y, 1, 1, color);
+static void tft_draw_pixel(uint8_t x, uint8_t y, uint16_t color) {
+  if (x >= 160 || y >= 128)
+    return;
+  tft_set_window(x, y, x, y);
+  tft_write_data(color >> 8);
+  tft_write_data(color & 0xFF);
 }
 
-static void tft_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+static void tft_fill_rect(uint8_t x, uint8_t y, uint8_t w, uint8_t h,
                           uint16_t color) {
   uint8_t hi = color >> 8;
   uint8_t lo = color & 0xFF;
 
-  // Hardware scaler intercept: Scale 160x128 logical to 320x240 physical!
   if (x >= 160 || y >= 128)
     return;
   if (x + w > 160)
@@ -731,11 +767,11 @@ static void tft_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
   if (y + h > 128)
     h = 128 - y;
 
-  tft_set_window(x * 2, y * 2, (x + w) * 2 - 1, (y + h) * 2 - 1);
+  tft_set_window(x, y, x + w - 1, y + h - 1);
 
   TFT_DC_HIGH();
   TFT_CS_LOW();
-  for (uint32_t i = 0; i < ((uint32_t)w * 2) * ((uint32_t)h * 2); i++) {
+  for (uint16_t i = 0; i < (uint16_t)w * h; i++) {
     spi_send(hi);
     spi_send(lo);
   }
@@ -842,7 +878,7 @@ static const uint8_t font5x7[] = {
 };
 
 // Draw a single character at (x, y) with given color, bg, and scale
-static void tft_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg,
+static void tft_draw_char(uint8_t x, uint8_t y, char c, uint16_t fg,
                           uint16_t bg, uint8_t size) {
   if (c < ' ' || c > '~')
     c = '?';
@@ -869,8 +905,8 @@ static void tft_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg,
 }
 
 // Draw a null-terminated string
-static void tft_draw_string(uint16_t x, uint16_t y, const char *str,
-                            uint16_t fg, uint16_t bg, uint8_t size) {
+static void tft_draw_string(uint8_t x, uint8_t y, const char *str, uint16_t fg,
+                            uint16_t bg, uint8_t size) {
   while (*str) {
     tft_draw_char(x, y, *str, fg, bg, size);
     x += 6 * size; // 5 pixel char + 1 pixel gap, times scale
@@ -879,102 +915,120 @@ static void tft_draw_string(uint16_t x, uint16_t y, const char *str,
 }
 
 // ======================== BITMAP DRAW ========================
-// Draws the full bitmap scaled 2x to fill the 320x240 display.
-// Logical bitmap is 160x128; each pixel is drawn as a 2x2 block.
-static void tft_draw_bitmap(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+// Draws the full bitmap.
+static void tft_draw_bitmap(uint8_t x, uint8_t y, uint8_t w, uint8_t h,
                             const uint16_t *bitmap) {
-  for (uint16_t row = 0; row < h; row++) {
-    for (uint16_t col = 0; col < w; col++) {
-      uint16_t color = bitmap[(uint32_t)row * w + col];
-      // Each source pixel -> 2x2 block on physical display
-      tft_set_window((x + col) * 2, (y + row) * 2,
-                     (x + col) * 2 + 1, (y + row) * 2 + 1);
-      TFT_DC_HIGH();
-      TFT_CS_LOW();
-      spi_send(color >> 8); spi_send(color & 0xFF);
-      spi_send(color >> 8); spi_send(color & 0xFF);
-      spi_send(color >> 8); spi_send(color & 0xFF);
-      spi_send(color >> 8); spi_send(color & 0xFF);
-      TFT_CS_HIGH();
-    }
+  tft_set_window(x, y, x + w - 1, y + h - 1);
+  TFT_DC_HIGH();
+  TFT_CS_LOW();
+  uint32_t total = (uint32_t)w * h;
+  for (uint32_t i = 0; i < total; i++) {
+    uint16_t color = bitmap[i];
+    spi_send((uint8_t)(color >> 8));
+    spi_send((uint8_t)(color & 0xFF));
   }
+  TFT_CS_HIGH();
 }
 
-// Draws only the top `rows` rows of the bitmap (2x scaled, for wipe animation).
-static void tft_draw_bitmap_rows(uint16_t x, uint16_t y, uint16_t w,
-                                 uint16_t h, const uint16_t *bitmap,
-                                 uint16_t rows) {
-  if (rows == 0) return;
-  if (rows > h) rows = h;
-  for (uint16_t row = 0; row < rows; row++) {
-    for (uint16_t col = 0; col < w; col++) {
-      uint16_t color = bitmap[(uint32_t)row * w + col];
-      tft_set_window((x + col) * 2, (y + row) * 2,
-                     (x + col) * 2 + 1, (y + row) * 2 + 1);
-      TFT_DC_HIGH();
-      TFT_CS_LOW();
-      spi_send(color >> 8); spi_send(color & 0xFF);
-      spi_send(color >> 8); spi_send(color & 0xFF);
-      spi_send(color >> 8); spi_send(color & 0xFF);
-      spi_send(color >> 8); spi_send(color & 0xFF);
-      TFT_CS_HIGH();
-    }
+// Draws only the top rows rows of the bitmap (for wipe animation).
+static void tft_draw_bitmap_rows(uint8_t x, uint8_t y, uint8_t w, uint8_t h,
+                                 const uint16_t *bitmap, uint8_t rows) {
+  if (rows == 0)
+    return;
+  if (rows > h)
+    rows = h;
+  tft_set_window(x, y, x + w - 1, y + rows - 1);
+  TFT_DC_HIGH();
+  TFT_CS_LOW();
+  uint32_t total = (uint32_t)w * rows;
+  for (uint32_t i = 0; i < total; i++) {
+    uint16_t color = bitmap[i];
+    spi_send((uint8_t)(color >> 8));
+    spi_send((uint8_t)(color & 0xFF));
   }
+  TFT_CS_HIGH();
 }
 
-// Draws a rectangular sub-region of a bitmap onto the screen (2x scaled).
-static void tft_draw_bitmap_region(uint16_t dest_x, uint16_t dest_y,
-                                   const uint16_t *bmp, uint16_t bmp_w,
-                                   uint16_t src_x, uint16_t src_y,
-                                   uint16_t draw_w, uint16_t draw_h) {
-  for (uint16_t row = 0; row < draw_h; row++) {
+// Draws a rectangular sub-region of a bitmap onto the screen.
+// dest_x/y  = top-left on screen
+// bmp       = full bitmap pointer, bmp_w = bitmap's total width
+// src_x/y   = top-left corner within the source bitmap
+// draw_w/h  = how many pixels wide/tall to copy
+static void tft_draw_bitmap_region(uint8_t dest_x, uint8_t dest_y,
+                                   const uint16_t *bmp, uint8_t bmp_w,
+                                   uint8_t src_x, uint8_t src_y, uint8_t draw_w,
+                                   uint8_t draw_h) {
+  tft_set_window(dest_x, dest_y, dest_x + draw_w - 1, dest_y + draw_h - 1);
+  TFT_DC_HIGH();
+  TFT_CS_LOW();
+  for (uint8_t row = 0; row < draw_h; row++) {
     uint32_t offset = (uint32_t)(src_y + row) * bmp_w + src_x;
-    for (uint16_t col = 0; col < draw_w; col++) {
+    for (uint8_t col = 0; col < draw_w; col++) {
       uint16_t color = bmp[offset + col];
-      tft_set_window((dest_x + col) * 2, (dest_y + row) * 2,
-                     (dest_x + col) * 2 + 1, (dest_y + row) * 2 + 1);
-      TFT_DC_HIGH();
-      TFT_CS_LOW();
-      spi_send(color >> 8); spi_send(color & 0xFF);
-      spi_send(color >> 8); spi_send(color & 0xFF);
-      spi_send(color >> 8); spi_send(color & 0xFF);
-      spi_send(color >> 8); spi_send(color & 0xFF);
-      TFT_CS_HIGH();
+      spi_send((uint8_t)(color >> 8));
+      spi_send((uint8_t)(color & 0xFF));
     }
   }
+  TFT_CS_HIGH();
 }
 
 // ======================== CIRCLE DRAW ========================
-// Bresenham midpoint circle – filled
-static void tft_fill_circle(uint16_t cx, uint16_t cy, uint16_t r, uint16_t color) {
+// Bresenham midpoint circle �?? filled
+static void tft_fill_circle(uint8_t cx, uint8_t cy, uint8_t r, uint16_t color) {
   int16_t x = 0, y = (int16_t)r, d = 1 - (int16_t)r;
   while (x <= y) {
+    // Draw horizontal spans for each octant pair
     int16_t x0, x1, ys;
-    
+    // span at ±y rows
     ys = (int16_t)cy - y;
     if (ys >= 0) {
-      x0 = (int16_t)cx - x; if (x0 < 0) x0 = 0;
+      x0 = (int16_t)cx - x;
+      if (x0 < 0)
+        x0 = 0;
       x1 = (int16_t)cx + x;
-      tft_fill_rect((uint16_t)x0, (uint16_t)ys, (uint16_t)(x1 - x0 + 1), 1, color);
+      if (x1 > 127)
+        x1 = 127;
+      if (x0 <= x1)
+        tft_fill_rect((uint8_t)x0, (uint8_t)ys, (uint8_t)(x1 - x0 + 1), 1,
+                      color);
     }
-    
     ys = (int16_t)cy + y;
-    x0 = (int16_t)cx - x; if (x0 < 0) x0 = 0;
-    x1 = (int16_t)cx + x;
-    tft_fill_rect((uint16_t)x0, (uint16_t)ys, (uint16_t)(x1 - x0 + 1), 1, color);
-
+    if (ys <= 159) {
+      x0 = (int16_t)cx - x;
+      if (x0 < 0)
+        x0 = 0;
+      x1 = (int16_t)cx + x;
+      if (x1 > 127)
+        x1 = 127;
+      if (x0 <= x1)
+        tft_fill_rect((uint8_t)x0, (uint8_t)ys, (uint8_t)(x1 - x0 + 1), 1,
+                      color);
+    }
+    // span at ±x rows
     ys = (int16_t)cy - x;
     if (ys >= 0) {
-      x0 = (int16_t)cx - y; if (x0 < 0) x0 = 0;
+      x0 = (int16_t)cx - y;
+      if (x0 < 0)
+        x0 = 0;
       x1 = (int16_t)cx + y;
-      tft_fill_rect((uint16_t)x0, (uint16_t)ys, (uint16_t)(x1 - x0 + 1), 1, color);
+      if (x1 > 127)
+        x1 = 127;
+      if (x0 <= x1)
+        tft_fill_rect((uint8_t)x0, (uint8_t)ys, (uint8_t)(x1 - x0 + 1), 1,
+                      color);
     }
-    
     ys = (int16_t)cy + x;
-    x0 = (int16_t)cx - y; if (x0 < 0) x0 = 0;
-    x1 = (int16_t)cx + y;
-    tft_fill_rect((uint16_t)x0, (uint16_t)ys, (uint16_t)(x1 - x0 + 1), 1, color);
-
+    if (ys <= 159) {
+      x0 = (int16_t)cx - y;
+      if (x0 < 0)
+        x0 = 0;
+      x1 = (int16_t)cx + y;
+      if (x1 > 127)
+        x1 = 127;
+      if (x0 <= x1)
+        tft_fill_rect((uint8_t)x0, (uint8_t)ys, (uint8_t)(x1 - x0 + 1), 1,
+                      color);
+    }
     if (d < 0) {
       d += 2 * x + 3;
     } else {
@@ -1189,32 +1243,23 @@ static void draw_bottom_wave(uint16_t active_color, uint8_t wt,
 }
 
 // ============================================================
-// PAGE 1 – Logo Splash
+// PAGE 1 �?? Logo Splash
 // Renders the exact bitmap from logo.h (bannari_logo, 160x128)
 // which contains the pre-rendered Microchip + Bannari Amman logos.
-// Holds for 5 seconds then fades out with a top→bottom white wipe.
+// Holds for 5 seconds then fades out with a top�??bottom white wipe.
 // ============================================================
 static void draw_logo_page(void) {
-  // The logo bitmap is 160x128 logical (320x256 scaled).
-  // The physical screen is 320x240 so only 120 logical rows (240px) fit.
-  // Crop to LOGO_H or 120, whichever fits.
-  uint16_t draw_h = (LOGO_H <= 120) ? LOGO_H : 120;
-
-  // ---- Display the bitmap centred or from top ----
-  tft_draw_bitmap(0, 0, LOGO_W, draw_h, bannari_logo);
-
-  // Fill any remaining rows below the logo with black
-  if (draw_h < 128) {
-    tft_fill_rect(0, draw_h, 160, 128 - draw_h, 0x0000);
-  }
+  // ---- Display the exact combined logo bitmap (full screen 160x128) ----
+  tft_draw_bitmap(0, 0, LOGO_W, LOGO_H, bannari_logo);
 
   // ---- Hold for 5 seconds ----
   delay_ms(5000);
 
-  // ---- Slow FADE-OUT: top-to-bottom white curtain wipe ----
-  for (uint16_t y = 0; y < 128; y += 4) {
-    tft_fill_rect(0, y, 160, 4, 0xFFFF);
-    delay_ms(15);
+  // ---- Slow FADE-OUT: top-to-bottom white curtain wipe (~900 ms) ----
+  // 32 bands �? 4 px each �? 28 ms delay = ~896 ms
+  for (uint8_t y = 0; y < 128; y += 4) {
+    tft_fill_rect(0, y, 160, 4, 0xFFFF); // overwrite strip with white
+    delay_ms(28);
   }
   // Final safety clear
   tft_fill_screen(0xFFFF);
@@ -1277,56 +1322,54 @@ static int aqi_linear(int I_Lo, int I_Hi, float BP_Lo, float BP_Hi, float C_p) {
 static int aqi_from_pm25(float c) {
   if (c < 0.0f)
     c = 0.0f;
-  if (c <= 12.0f)
-    return aqi_linear(0, 50, 0.0f, 12.0f, c);
-  if (c <= 35.4f)
-    return aqi_linear(51, 100, 12.1f, 35.4f, c);
-  if (c <= 55.4f)
-    return aqi_linear(101, 150, 35.5f, 55.4f, c);
-  if (c <= 150.4f)
-    return aqi_linear(151, 200, 55.5f, 150.4f, c);
-  if (c <= 250.4f)
-    return aqi_linear(201, 300, 150.5f, 250.4f, c);
-  if (c <= 500.4f)
-    return aqi_linear(301, 500, 250.5f, 500.4f, c);
+  if (c <= 30.0f)
+    return aqi_linear(0, 50, 0.0f, 30.0f, c);
+  if (c <= 60.0f)
+    return aqi_linear(51, 100, 31.0f, 60.0f, c);
+  if (c <= 90.0f)
+    return aqi_linear(101, 200, 61.0f, 90.0f, c);
+  if (c <= 120.0f)
+    return aqi_linear(201, 300, 91.0f, 120.0f, c);
+  if (c <= 250.0f)
+    return aqi_linear(301, 400, 121.0f, 250.0f, c);
+  if (c <= 500.0f)
+    return aqi_linear(401, 500, 251.0f, 500.0f, c);
   return 500;
 }
 
-static int aqi_from_co(float c) { // c in ppm
+static int aqi_from_co(float c) { // c in mg/m3 (CPCB Standard)
   if (c < 0.0f)
     c = 0.0f;
-  if (c <= 4.4f)
-    return aqi_linear(0, 50, 0.0f, 4.4f, c);
-  if (c <= 9.4f)
-    return aqi_linear(51, 100, 4.5f, 9.4f, c);
-  if (c <= 12.4f)
-    return aqi_linear(101, 150, 9.5f, 12.4f, c);
-  if (c <= 15.4f)
-    return aqi_linear(151, 200, 12.5f, 15.4f, c);
-  if (c <= 30.4f)
-    return aqi_linear(201, 300, 15.5f, 30.4f, c);
-  if (c <= 50.4f)
-    return aqi_linear(301, 400, 30.5f, 50.4f, c);
-  return 500;
+  if (c <= 2.0f)
+    return aqi_linear(0, 50, 0.0f, 2.0f, c);
+  if (c <= 10.0f)
+    return aqi_linear(51, 100, 2.1f, 10.0f, c);
+  if (c <= 17.0f)
+    return aqi_linear(101, 200, 10.1f, 17.0f, c);
+  if (c <= 34.0f)
+    return aqi_linear(201, 300, 17.1f, 34.0f, c);
+  if (c <= 44.0f)
+    return aqi_linear(301, 400, 34.1f, 44.0f, c);
+  return aqi_linear(401, 500, 44.1f, 100.0f, c);
 }
 
-static int aqi_from_o3(float c) { // c in ppb (1-hr standard)
+static int aqi_from_o3(float c) { // c in ug/m3 (CPCB Standard)
   if (c < 0.0f)
     c = 0.0f;
-  if (c <= 54.0f)
-    return aqi_linear(0, 50, 0.0f, 54.0f, c);
-  if (c <= 70.0f)
-    return aqi_linear(51, 100, 55.0f, 70.0f, c);
-  if (c <= 85.0f)
-    return aqi_linear(101, 150, 71.0f, 85.0f, c);
-  if (c <= 105.0f)
-    return aqi_linear(151, 200, 86.0f, 105.0f, c);
-  if (c <= 200.0f)
-    return aqi_linear(201, 300, 106.0f, 200.0f, c);
-  return 301;
+  if (c <= 50.0f)
+    return aqi_linear(0, 50, 0.0f, 50.0f, c);
+  if (c <= 100.0f)
+    return aqi_linear(51, 100, 51.0f, 100.0f, c);
+  if (c <= 168.0f)
+    return aqi_linear(101, 200, 101.0f, 168.0f, c);
+  if (c <= 208.0f)
+    return aqi_linear(201, 300, 169.0f, 208.0f, c);
+  if (c <= 748.0f)
+    return aqi_linear(301, 400, 209.0f, 748.0f, c);
+  return aqi_linear(401, 500, 749.0f, 1000.0f, c);
 }
 
-static int aqi_from_nh3(float c) { // c in ug/m3
+static int aqi_from_nh3(float c) { // c in ug/m3 (CPCB Standard)
   if (c < 0.0f)
     c = 0.0f;
   if (c <= 200.0f)
@@ -1339,9 +1382,7 @@ static int aqi_from_nh3(float c) { // c in ug/m3
     return aqi_linear(201, 300, 801.0f, 1200.0f, c);
   if (c <= 1800.0f)
     return aqi_linear(301, 400, 1201.0f, 1800.0f, c);
-  if (c <= 2800.0f)
-    return aqi_linear(401, 500, 1801.0f, 2800.0f, c);
-  return 500;
+  return aqi_linear(401, 500, 1801.0f, 2500.0f, c);
 }
 
 // Calculates combined AQI using max of all sub-indices.
@@ -1435,7 +1476,7 @@ static void update_background_sensors(int *out_aqi, float *out_o3,
 }
 
 // ============================================================
-// PAGE 2 – AQI Default display
+// PAGE 2 �?? AQI Default display
 // Shows wave gauge, AQI number, live location, status label.
 // Returns when PA17 goes HIGH (switch to sensor page).
 // ============================================================
@@ -1543,7 +1584,7 @@ static void run_aqi_page(int *saved_aqi, int *saved_target) {
       tft_draw_string(80 - (w * 12) / 2, 102, label, active_color, bg, 2);
     }
 
-    // ---- Read sensors every loop tick – continuous serial + AQI update ----
+    // ---- Read sensors every loop tick �?? continuous serial + AQI update ----
     {
       update_background_sensors(&target_aqi, NULL, NULL, NULL, NULL, NULL, NULL,
                                 NULL);
@@ -1552,7 +1593,7 @@ static void run_aqi_page(int *saved_aqi, int *saved_target) {
 }
 
 // ============================================================
-// PAGE 3 – Sensor Detail Screen (Dashboard Grid)
+// PAGE 3 �?? Sensor Detail Screen (Dashboard Grid)
 // ============================================================
 
 static void draw_static_card(int x, int y, const char *label) {
@@ -1676,7 +1717,8 @@ static void run_sensor_page(void) {
 }
 
 // ============================================================
-static void draw_thermometer(uint8_t x, uint8_t y, uint16_t color, uint16_t inner_c) {
+static void draw_thermometer(uint8_t x, uint8_t y, uint16_t color,
+                             uint16_t inner_c) {
   tft_fill_circle(x + 5, y + 12, 4, color);
   tft_fill_rect(x + 3, y, 5, 10, color);
   tft_fill_circle(x + 5, y + 12, 2, inner_c);
@@ -1688,55 +1730,60 @@ static void draw_thermometer(uint8_t x, uint8_t y, uint16_t color, uint16_t inne
   tft_fill_rect(x + 10, y + 8, 3, 1, color);
 }
 
-static void draw_water_drop(uint8_t x, uint8_t y, uint16_t color, uint16_t inner_c) {
+static void draw_water_drop(uint8_t x, uint8_t y, uint16_t color,
+                            uint16_t inner_c) {
   tft_fill_circle(x + 6, y + 10, 5, color);
-  for(int i=0; i<5; i++) {
-    tft_fill_rect(x + 6 - i, y + 9 - i - 2, (i*2) + 1, 1, color);
+  for (int i = 0; i < 5; i++) {
+    tft_fill_rect(x + 6 - i, y + 9 - i - 2, (i * 2) + 1, 1, color);
   }
   tft_fill_circle(x + 6, y + 11, 2, inner_c);
 }
 
 static void run_dht_page(void) {
-  uint16_t bg = 0xF7DF; // Very light blue
+  uint16_t bg = 0xF7DF;      // Very light blue
   uint16_t card_bg = 0xFFFF; // White
   uint16_t title_c = 0x18E3; // Dark blue
-  
+
   tft_fill_screen(bg);
   tft_draw_string(5, 5, "< Temperature & humidity", title_c, bg, 1);
 
   // Shelf
   tft_fill_rect(106, 110, 54, 18, 0xD6BA); // Shelf top
-  
+
   // Plant Stems
-  tft_fill_rect(130, 50, 2, 60, 0x7BEF); 
+  tft_fill_rect(130, 50, 2, 60, 0x7BEF);
   tft_fill_rect(142, 60, 1, 50, 0x7BEF);
 
   // Leaves
-  tft_fill_circle(126, 45, 12, 0x9E73); 
+  tft_fill_circle(126, 45, 12, 0x9E73);
   tft_fill_circle(148, 40, 9, 0x5D2D);
   tft_fill_circle(145, 65, 7, 0x9E73);
   tft_fill_circle(123, 75, 6, 0x5D2D);
-  
+
   // Pot
-  tft_fill_rect(125, 95, 18, 15, 0xFFFF); 
-  tft_fill_rect(122, 93, 24, 3, 0xFFFF);   
+  tft_fill_rect(125, 95, 18, 15, 0xFFFF);
+  tft_fill_rect(122, 93, 24, 3, 0xFFFF);
 
   // Little squarish sensor box
-  tft_fill_rect(108, 85, 20, 25, 0xBDB6); 
-  tft_fill_rect(110, 87, 16, 21, 0xCE59); 
+  tft_fill_rect(108, 85, 20, 25, 0xBDB6);
+  tft_fill_rect(110, 87, 16, 21, 0xCE59);
   draw_thermometer(110, 90, 0xFFFF, 0xCE59);
 
   // Cards Base
   tft_fill_rect(5, 20, 100, 40, card_bg);
-  tft_fill_rect(5, 65, 100, 40, card_bg); 
-  
-  tft_draw_pixel(5, 20, bg); tft_draw_pixel(104, 20, bg);
-  tft_draw_pixel(5, 59, bg); tft_draw_pixel(104, 59, bg);
-  tft_draw_pixel(5, 65, bg); tft_draw_pixel(104, 65, bg);
-  tft_draw_pixel(5, 104, bg); tft_draw_pixel(104, 104, bg);
+  tft_fill_rect(5, 65, 100, 40, card_bg);
+
+  tft_draw_pixel(5, 20, bg);
+  tft_draw_pixel(104, 20, bg);
+  tft_draw_pixel(5, 59, bg);
+  tft_draw_pixel(104, 59, bg);
+  tft_draw_pixel(5, 65, bg);
+  tft_draw_pixel(104, 65, bg);
+  tft_draw_pixel(5, 104, bg);
+  tft_draw_pixel(104, 104, bg);
 
   // Gradient bars
-  tft_fill_rect(15, 56, 30, 2, 0x64BF); // Blue bar card 1
+  tft_fill_rect(15, 56, 30, 2, 0x64BF);  // Blue bar card 1
   tft_fill_rect(15, 101, 30, 2, 0x64BF); // Blue bar card 2
 
   // Icons
@@ -1744,56 +1791,64 @@ static void run_dht_page(void) {
   draw_water_drop(10, 73, 0x64BF, 0xFFFF);
 
   float last_t = -999.0f, last_h = -999.0f;
-  
+
   while (1) {
-    if (check_button_toggle()) return;
-    
+    if (check_button_toggle())
+      return;
+
     float o3, co, nh3, dust, co2, t, h;
     int aqi;
     update_background_sensors(&aqi, &o3, &co, &nh3, &dust, &co2, &t, &h);
-    
+
     if (t != last_t || h != last_h) {
-       last_t = t;
-       last_h = h;
-       
-       char tbuf[16];
-       char hbuf[16];
-       
-       tft_fill_rect(30, 23, 70, 18, card_bg); // text clear
-       tft_fill_rect(30, 68, 70, 18, card_bg); // text clear
-       tft_fill_rect(30, 42, 70, 10, card_bg); // subtext clear
-       tft_fill_rect(30, 87, 70, 10, card_bg); // subtext clear
-       
-       if (t < -50.0f || h < 0.0f) {
-           tft_draw_string(30, 23, "--.- C", 0x0000, card_bg, 2);
-           tft_draw_string(30, 68, "--.- %", 0x0000, card_bg, 2);
-       } else {
-           sprintf(tbuf, "%.1f", t);
-           int offset = 0;
-           for(int i=0; tbuf[i] != '\0'; i++) offset++;
-           offset *= 12;
-           tft_draw_string(30, 23, tbuf, 0x0000, card_bg, 2);
-           tft_draw_circle_outline(30 + offset + 3, 26, 2, 0x0000);
-           tft_draw_string(30 + offset + 8, 23, "C", 0x0000, card_bg, 2);
-           
-           sprintf(hbuf, "%.1f%%", h);
-           tft_draw_string(30, 68, hbuf, 0x0000, card_bg, 2);
-       }
-       
-       const char* t_txt = "Comfortable";
-       if (t > 26.0f) t_txt = "Hot";
-       else if (t < 18.0f) t_txt = "Cold";
-       if (t < -50.0f) t_txt = "Reading...";
-       
-       const char* h_txt = "Comfortable";
-       if (h > 60.0f) h_txt = "Humid";
-       else if (h < 40.0f) h_txt = "Slightly dry";
-       if (h < 0.0f) h_txt = "Reading...";
-       
-       tft_draw_string(30, 42, t_txt, 0xB5B6, card_bg, 1);
-       tft_draw_string(30, 87, h_txt, 0xB5B6, card_bg, 1);
+      last_t = t;
+      last_h = h;
+
+      char tbuf[16];
+      char hbuf[16];
+
+      tft_fill_rect(30, 23, 70, 18, card_bg); // text clear
+      tft_fill_rect(30, 68, 70, 18, card_bg); // text clear
+      tft_fill_rect(30, 42, 70, 10, card_bg); // subtext clear
+      tft_fill_rect(30, 87, 70, 10, card_bg); // subtext clear
+
+      if (t < -50.0f || h < 0.0f) {
+        tft_draw_string(30, 23, "--.- C", 0x0000, card_bg, 2);
+        tft_draw_string(30, 68, "--.- %", 0x0000, card_bg, 2);
+      } else {
+        sprintf(tbuf, "%.1f", t);
+        int offset = 0;
+        for (int i = 0; tbuf[i] != '\0'; i++)
+          offset++;
+        offset *= 12;
+        tft_draw_string(30, 23, tbuf, 0x0000, card_bg, 2);
+        tft_draw_circle_outline(30 + offset + 3, 26, 2, 0x0000);
+        tft_draw_string(30 + offset + 8, 23, "C", 0x0000, card_bg, 2);
+
+        sprintf(hbuf, "%.1f%%", h);
+        tft_draw_string(30, 68, hbuf, 0x0000, card_bg, 2);
+      }
+
+      const char *t_txt = "Comfortable";
+      if (t > 26.0f)
+        t_txt = "Hot";
+      else if (t < 18.0f)
+        t_txt = "Cold";
+      if (t < -50.0f)
+        t_txt = "Reading...";
+
+      const char *h_txt = "Comfortable";
+      if (h > 60.0f)
+        h_txt = "Humid";
+      else if (h < 40.0f)
+        h_txt = "Slightly dry";
+      if (h < 0.0f)
+        h_txt = "Reading...";
+
+      tft_draw_string(30, 42, t_txt, 0xB5B6, card_bg, 1);
+      tft_draw_string(30, 87, h_txt, 0xB5B6, card_bg, 1);
     }
-    
+
     delay_ms(50);
   }
 }
@@ -1872,10 +1927,10 @@ static void run_manual_page(void) {
 }
 
 // ============================================================
-// Top-level display controller – orchestrates all pages
+// Top-level display controller �?? orchestrates all pages
 // ============================================================
 static void run_display(void) {
-  // Page 1 – Logo splash (one-shot, untouched)
+  // Page 1 �?? Logo splash (one-shot, untouched)
   draw_logo_page();
 
   int count = 0; // State variable: 0 = AQI, 1 = Sensor
