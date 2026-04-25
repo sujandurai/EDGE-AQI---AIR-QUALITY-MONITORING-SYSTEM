@@ -96,7 +96,7 @@ build/default/production/_ext/1360937237/main.o: ../src/main.c \
  ../src/config/default/peripheral/adc/plib_adc.h \
  ../src/config/default/peripheral/adc/plib_adc_common.h \
  ../src/config/default/peripheral/sercom/usart/plib_sercom3_usart.h \
- ../src/logo.h ../src/wifi_manager.h
+ ../src/logo.h ../src/tinyml_wrapper.h
 ../src/config/default/definitions.h:
 ../src/config/default/peripheral/nvmctrl/plib_nvmctrl.h:
 ../src/config/default/device.h:
@@ -196,4 +196,4 @@ build/default/production/_ext/1360937237/main.o: ../src/main.c \
 ../src/config/default/peripheral/adc/plib_adc_common.h:
 ../src/config/default/peripheral/sercom/usart/plib_sercom3_usart.h:
 ../src/logo.h:
-../src/wifi_manager.h:
+../src/tinyml_wrapper.h:

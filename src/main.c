@@ -22,6 +22,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "tinyml_wrapper.h"
+
+// --- MQTT Global State and Forward Declarations ---
+static bool mqtt_connected = false;
+static void MQTT_Publish(const char* topic, const char* payload);
 
 // TrustZone Native Register Aliases (using standard addressing)
 
@@ -29,7 +34,7 @@
 // alias)
 #define PA17_IS_HIGH() ((PORT_SEC_REGS->GROUP[0].PORT_IN >> 17u) & 1u)
 
-static void delay_us(int us) {
+void delay_us(int us) {
   // Use exact hardware cycle counting for perfectly deterministic delays
   if ((SysTick->CTRL & SysTick_CTRL_ENABLE_Msk) == 0) {
     SysTick->LOAD = 0xFFFFFF;
@@ -229,16 +234,30 @@ static float calculate_Rs(float voltage) {
 }
 
 static float read_dust() {
+  // Perform a dummy average read to switch the ADC multiplexer to AIN0 (Dust)
+  // *before* we turn the LED on. This prevents the multiplexer's settling delays
+  // from ruining the strict 280us pulse timing required by the Sharp sensor.
+  read_adc_avg(0); 
+
   float sum = 0;
   for (int i = 0; i < 5; i++) {
     PORT_REGS->GROUP[0].PORT_OUTSET = (1U << 3); // PA03 HIGH (Dust LED)
     delay_us(280);
 
-    uint16_t adc = read_adc_avg(0); // AIN0 (PA02)
+    // Single fast ADC read (do NOT average 5x over 250us here! The peak is very brief)
+    ADC_REGS->ADC_SWTRIG |= (1 << 1);          // START bit
+    while (ADC_REGS->ADC_SYNCBUSY & (1 << 10)) // SWTRIG sync
+      ;
+    while ((ADC_REGS->ADC_INTFLAG & (1 << 0)) == 0) // Wait for RESRDY
+      ;
+    uint16_t adc = ADC_REGS->ADC_RESULT;
+    ADC_REGS->ADC_INTFLAG = (1 << 0); // clear flag
 
     delay_us(40);
     PORT_REGS->GROUP[0].PORT_OUTCLR = (1U << 3); // PA03 LOW
-    delay_us(100);
+    
+    // The datasheet requires a 10ms cycle time (10000us). We've used 320us.
+    delay_us(9680); 
 
     sum += adc_to_voltage(adc);
   }
@@ -274,7 +293,7 @@ static float read_mg811_co2() {
 }
 
 // ======================== DELAY =============================
-static void delay_ms(uint32_t ms) {
+void delay_ms(uint32_t ms) {
   for (uint32_t i = 0; i < ms; i++) {
     delay_us(1000); // 1000 us = 1 ms precision hardware delay
   }
@@ -1408,6 +1427,90 @@ static int calculate_real_aqi(void) {
   return aqi;
 }
 
+static void diagnose_air_quality(float o3, float co, float nh3, float dust, float co2, char* out_buf, int buf_size, char** out_class, float* out_conf) {
+    // 1. Calculate Mathematical Deviations from Normal Baseline
+    float o3_base = 1.4f, o3_max = 5.0f;
+    float co_base = 9.0f, co_max = 30.0f;
+    float nh3_base = 0.9f, nh3_max = 5.0f;
+    float dust_base = 0.0f, dust_max = 100.0f;
+    float co2_base = 546.0f, co2_max = 1000.0f;
+
+    float dev_o3 = (o3 <= o3_base) ? 0.0f : ((o3 - o3_base) / (o3_max - o3_base)) * 100.0f;
+    if (dev_o3 > 100.0f) dev_o3 = 100.0f;
+    
+    float dev_co = (co <= co_base) ? 0.0f : ((co - co_base) / (co_max - co_base)) * 100.0f;
+    if (dev_co > 100.0f) dev_co = 100.0f;
+    
+    float dev_nh3 = (nh3 <= nh3_base) ? 0.0f : ((nh3 - nh3_base) / (nh3_max - nh3_base)) * 100.0f;
+    if (dev_nh3 > 100.0f) dev_nh3 = 100.0f;
+    
+    float dev_dust = (dust <= dust_base) ? 0.0f : ((dust - dust_base) / (dust_max - dust_base)) * 100.0f;
+    if (dev_dust > 100.0f) dev_dust = 100.0f;
+    
+    float dev_co2 = (co2 <= co2_base) ? 0.0f : ((co2 - co2_base) / (co2_max - co2_base)) * 100.0f;
+    if (dev_co2 > 100.0f) dev_co2 = 100.0f;
+
+    // 2. Compute Class Similarity Distances
+    float sim_vent = dev_co2;
+    float sim_fire = (dev_dust + dev_co) / 2.0f;
+    float sim_chem = dev_nh3;
+    float sim_exhaust = (dev_o3 + dev_co) / 2.0f;
+    
+    float max_sim = sim_vent;
+    if (sim_fire > max_sim) max_sim = sim_fire;
+    if (sim_chem > max_sim) max_sim = sim_chem;
+    if (sim_exhaust > max_sim) max_sim = sim_exhaust;
+    
+    float sim_safe = 100.0f - max_sim;
+    if (sim_safe < 0.0f) sim_safe = 0.0f;
+
+    // 3. Determine Final Inference Label
+    const char* pred_class = "NORMAL ENVIRONMENT";
+    float confidence = sim_safe / 100.0f;
+    
+    if (max_sim > 20.0f) { // If any danger pattern exceeds 20%
+        if (max_sim == sim_vent) { pred_class = "POOR VENTILATION"; confidence = sim_vent / 100.0f; }
+        else if (max_sim == sim_fire) { pred_class = "FIRE/SMOKE HAZARD"; confidence = sim_fire / 100.0f; }
+        else if (max_sim == sim_chem) { pred_class = "CHEMICAL LEAK"; confidence = sim_chem / 100.0f; }
+        else if (max_sim == sim_exhaust) { pred_class = "EXHAUST FUMES"; confidence = sim_exhaust / 100.0f; }
+    }
+
+    if (out_class) *out_class = (char*)pred_class;
+    if (out_conf) *out_conf = confidence;
+
+    // 4. Format Output String
+    snprintf(out_buf, buf_size,
+        "\r\n--- EdgeAQI Algorithmic Diagnosis ---\r\n"
+        "  [Features Analyzed: O3, CO, NH3, PM2.5, CO2]\r\n"
+        "  \r\n"
+        "  >> Calculating Sensor Deviations...\r\n"
+        "     Ozone (O3)           : %6.2f%% (%s)\r\n"
+        "     Carbon Monoxide (CO) : %6.2f%% (%s)\r\n"
+        "     Ammonia (NH3)        : %6.2f%% (%s)\r\n"
+        "     Dust (PM2.5)         : %6.2f%% (%s)\r\n"
+        "     Carbon Dioxide (CO2) : %6.2f%% (%s)\r\n"
+        "  \r\n"
+        "  >> Computing Classification Similarity...\r\n"
+        "     Similarity to [Safe Environment]   : %6.2f%%\r\n"
+        "     Similarity to [Poor Ventilation]   : %6.2f%%\r\n"
+        "     Similarity to [Fire/Smoke Hazard]  : %6.2f%%\r\n"
+        "     Similarity to [Chemical Leak]      : %6.2f%%\r\n"
+        "     Similarity to [Exhaust Fumes]      : %6.2f%%\r\n"
+        "  \r\n"
+        "  >> FINAL DIAGNOSIS INFERENCE:\r\n"
+        "     Diagnosis Class : %s\r\n"
+        "     Confidence Score: %.2f\r\n"
+        "---------------------------------------\r\n",
+        dev_o3, (dev_o3 > 20.0f ? "ELEVATED!" : "Normal"),
+        dev_co, (dev_co > 20.0f ? "ELEVATED!" : "Normal"),
+        dev_nh3, (dev_nh3 > 20.0f ? "ELEVATED!" : "Normal"),
+        dev_dust, (dev_dust > 20.0f ? "ELEVATED!" : "Normal"),
+        dev_co2, (dev_co2 > 20.0f ? "ELEVATED!" : "Normal"),
+        sim_safe, sim_vent, sim_fire, sim_chem, sim_exhaust,
+        pred_class, confidence
+    );
+}
+
 static void update_background_sensors(int *out_aqi, float *out_o3,
                                       float *out_co, float *out_nh3,
                                       float *out_dust, float *out_co2,
@@ -1457,6 +1560,26 @@ static void update_background_sensors(int *out_aqi, float *out_o3,
     ;
   SERCOM3_USART_Write((uint8_t *)tbuf, strlen(tbuf));
 
+  // -------- EdgeAQI Algorithmic Output --------
+  char diag_buf[1024]; 
+  char* pred_class = "UNKNOWN";
+  float confidence = 0.0f;
+  diagnose_air_quality(o3, co, nh3, dust, co2, diag_buf, sizeof(diag_buf), &pred_class, &confidence);
+  while (SERCOM3_USART_WriteIsBusy())
+    ;
+  SERCOM3_USART_Write((uint8_t *)diag_buf, strlen(diag_buf));
+  // --------------------------------------------
+
+  /* Old TinyML Inference (Commented out because algorithmic output replaces it)
+  if (strstr(diag_buf, "Normal") == NULL) {
+    float features[7] = { o3, co, nh3, dust, co2, last_t, last_h };
+    char ml_buf[300];
+    tinyml_run_inference(features, 7, ml_buf, sizeof(ml_buf));
+    while (SERCOM3_USART_WriteIsBusy());
+    SERCOM3_USART_Write((uint8_t *)ml_buf, strlen(ml_buf));
+  }
+  */
+
   if (out_aqi)
     *out_aqi = new_aqi;
   if (out_o3)
@@ -1473,6 +1596,31 @@ static void update_background_sensors(int *out_aqi, float *out_o3,
     *out_t = last_t;
   if (out_h)
     *out_h = last_h;
+
+  // --- MQTT PUBLISHING THROTTLE ---
+  static int mqtt_throttle = 0;
+  if (++mqtt_throttle >= 5) {
+      mqtt_throttle = 0;
+      if (mqtt_connected) {
+          char json_payload[384];
+          snprintf(json_payload, sizeof(json_payload), 
+                   "{\"device_id\":\"pic32\",\"pm25\":%.1f,\"co2\":%.1f,\"o3\":%.2f,\"co\":%.1f,\"nh3\":%.1f,\"temp\":%.1f,\"hum\":%.1f,\"aqi\":%d,\"relay\":\"OFF\",\"mode\":\"AUTO\",\"diagnosis\":\"%s\",\"confidence\":%.2f}",
+                   dust, co2, o3, co, nh3, last_t, last_h, new_aqi, pred_class, confidence);
+                   
+          MQTT_Publish("aqms/pic32/data", json_payload);
+          
+          if (mqtt_connected) {
+              char pub_msg[150];
+              snprintf(pub_msg, sizeof(pub_msg), "\r\n[MQTT] Published Data! Length: %d\r\n", strlen(json_payload));
+              while (SERCOM3_USART_WriteIsBusy());
+              SERCOM3_USART_Write((uint8_t *)pub_msg, strlen(pub_msg));
+          } else {
+              char fail_msg[] = "\r\n[MQTT ERROR] Disconnected!\r\n";
+              while (SERCOM3_USART_WriteIsBusy());
+              SERCOM3_USART_Write((uint8_t *)fail_msg, strlen(fail_msg));
+          }
+      }
+  }
 }
 
 // ============================================================
@@ -1929,6 +2077,160 @@ static void run_manual_page(void) {
 // ============================================================
 // Top-level display controller �?? orchestrates all pages
 // ============================================================
+// ============================================================
+// WIFI MANAGER
+// ============================================================
+#define ESP_BUFFER_SIZE 256
+static char espBuffer[ESP_BUFFER_SIZE];
+static uint16_t bufferIndex = 0;
+
+static void ESP_Write(const char* str) {
+    while (*str) {
+        while (!(SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_DRE_Msk));
+        SERCOM5_REGS->USART_INT.SERCOM_DATA = (uint16_t)*str++;
+    }
+}
+
+static void SERCOM5_ClearErrors(void) {
+    SERCOM5_REGS->USART_INT.SERCOM_STATUS = (uint16_t)(
+        SERCOM_USART_INT_STATUS_BUFOVF_Msk |
+        SERCOM_USART_INT_STATUS_FERR_Msk   |
+        SERCOM_USART_INT_STATUS_PERR_Msk);
+    SERCOM5_REGS->USART_INT.SERCOM_INTFLAG = (uint8_t)SERCOM_USART_INT_INTFLAG_ERROR_Msk;
+}
+
+static void ESP_FlushRx(uint32_t wait_ms) {
+    uint32_t idle = 0;
+    SERCOM5_ClearErrors(); 
+    while (idle < wait_ms) {
+        if (SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_RXC_Msk) {
+            (void)SERCOM5_REGS->USART_INT.SERCOM_DATA;
+            idle = 0; 
+        } else {
+            delay_ms(1);
+            idle++;
+        }
+    }
+    SERCOM5_ClearErrors(); 
+}
+
+void WIFI_Init(void) {
+    bufferIndex = 0;
+    memset(espBuffer, 0, ESP_BUFFER_SIZE);
+}
+
+bool WIFI_SendCommand(const char* command, const char* expected_response, uint32_t timeout_ms) {
+    ESP_FlushRx(50); 
+    memset(espBuffer, 0, ESP_BUFFER_SIZE);
+    bufferIndex = 0;
+    ESP_Write(command);
+    while (!(SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_TXC_Msk));
+
+    const uint32_t TICKS_PER_MS = 8000UL;
+    uint32_t deadline = timeout_ms * TICKS_PER_MS;
+    uint32_t noDataCount = 0;
+
+    while (noDataCount < deadline) {
+        if (SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_RXC_Msk) {
+            uint8_t data = (uint8_t)SERCOM5_REGS->USART_INT.SERCOM_DATA;
+            
+            if (bufferIndex < ESP_BUFFER_SIZE - 1) {
+                espBuffer[bufferIndex++] = (char)data;
+                espBuffer[bufferIndex]   = '\0';
+            }
+            if (strstr(espBuffer, expected_response) != NULL) {
+                return true;
+            }
+            noDataCount = 0; 
+        } else {
+            noDataCount++;
+        }
+    }
+    return false;
+}
+
+bool WIFI_IsAlive(void) {
+    return WIFI_SendCommand("AT\r\n", "OK", 2000);
+}
+
+bool WIFI_SetMode(uint8_t mode) {
+    char cmd[24];
+    snprintf(cmd, sizeof(cmd), "AT+CWMODE=%u\r\n", mode);
+    return WIFI_SendCommand(cmd, "OK", 3000);
+}
+
+bool WIFI_Connect(const char* ssid, const char* password) {
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"\r\n", ssid, password);
+    return WIFI_SendCommand(cmd, "WIFI GOT IP", 20000);
+}
+
+static void ESP_WriteRaw(const uint8_t* data, uint16_t len) {
+    for (uint16_t i = 0; i < len; i++) {
+        while (!(SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_DRE_Msk));
+        SERCOM5_REGS->USART_INT.SERCOM_DATA = (uint16_t)data[i];
+    }
+}
+
+static bool MQTT_Connect(void) {
+    WIFI_SendCommand("AT+CIPMUX=0\r\n", "OK", 2000); 
+    if (!WIFI_SendCommand("AT+CIPSTART=\"TCP\",\"broker.hivemq.com\",1883\r\n", "CONNECT", 10000)) {
+        return false;
+    }
+    
+    uint8_t connect_pkt[24] = {
+        0x10, 0x16, 
+        0x00, 0x04, 'M', 'Q', 'T', 'T', 
+        0x04, 0x02, 0x00, 0x3C, 
+        0x00, 0x0A, 'a', 'q', 'm', 's', '-', 'p', 'i', 'c', '3', '2'
+    };
+    
+    if (WIFI_SendCommand("AT+CIPSEND=24\r\n", ">", 3000)) {
+        ESP_WriteRaw(connect_pkt, 24);
+        delay_ms(1000); 
+        mqtt_connected = true;
+        return true;
+    }
+    return false;
+}
+
+static void MQTT_Publish(const char* topic, const char* payload) {
+    if (!mqtt_connected) return;
+    
+    uint16_t topic_len = strlen(topic);
+    uint16_t payload_len = strlen(payload);
+    uint16_t remaining_length = 2 + topic_len + payload_len;
+    
+    uint8_t rem_len_bytes[4];
+    uint8_t rem_len_count = 0;
+    uint32_t x = remaining_length;
+    do {
+        uint8_t encodedByte = x % 128;
+        x = x / 128;
+        if (x > 0) {
+            encodedByte |= 128;
+        }
+        rem_len_bytes[rem_len_count++] = encodedByte;
+    } while (x > 0);
+    
+    uint16_t total_packet_size = 1 + rem_len_count + remaining_length;
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%u\r\n", total_packet_size);
+    
+    if (WIFI_SendCommand(cmd, ">", 2000)) {
+        uint8_t header = 0x30;
+        ESP_WriteRaw(&header, 1);
+        ESP_WriteRaw(rem_len_bytes, rem_len_count);
+        uint8_t tlen[2] = { (uint8_t)(topic_len >> 8), (uint8_t)(topic_len & 0xFF) };
+        ESP_WriteRaw(tlen, 2);
+        ESP_WriteRaw((const uint8_t*)topic, topic_len);
+        ESP_WriteRaw((const uint8_t*)payload, payload_len);
+        delay_ms(500); 
+    } else {
+        mqtt_connected = false;
+    }
+}
+
 static void run_display(void) {
   // Page 1 �?? Logo splash (one-shot, untouched)
   draw_logo_page();
@@ -1961,6 +2263,28 @@ static void run_display(void) {
 // ======================== MAIN ==============================
 int main(void) {
   SYS_Initialize(NULL); // SERCOM3_USART_Initialize() is called inside here
+
+  // --- Initialize SERCOM5 on PB02/PB03 for WiFi (ESP-01S) ---
+  // Enable MCLK for SERCOM5
+  MCLK_REGS->MCLK_APBCMASK |= MCLK_APBCMASK_SERCOM5_Msk;
+
+  // Enable GCLK for SERCOM5 (ch22)
+  GCLK_REGS->GCLK_PCHCTRL[22] = GCLK_PCHCTRL_GEN(0x0) | GCLK_PCHCTRL_CHEN_Msk;
+  while (!(GCLK_REGS->GCLK_PCHCTRL[22] & GCLK_PCHCTRL_CHEN_Msk));
+
+  // SERCOM5: PB02=PAD0(TX), PB03=PAD1(RX) -- MUX D (0x3)
+  PORT_SEC_REGS->GROUP[1].PORT_PMUX[1] = 0x33U; // MUX D for PB02 and PB03
+  PORT_SEC_REGS->GROUP[1].PORT_PINCFG[2] |= PORT_PINCFG_PMUXEN_Msk; // Enable Peripheral Muxing
+  PORT_SEC_REGS->GROUP[1].PORT_PINCFG[3] |= PORT_PINCFG_PMUXEN_Msk;
+
+  SERCOM5_REGS->USART_INT.SERCOM_CTRLA = SERCOM_USART_INT_CTRLA_SWRST_Msk;
+  while (SERCOM5_REGS->USART_INT.SERCOM_SYNCBUSY & SERCOM_USART_INT_SYNCBUSY_SWRST_Msk);
+  SERCOM5_REGS->USART_INT.SERCOM_CTRLA = SERCOM_USART_INT_CTRLA_MODE(0x1) | SERCOM_USART_INT_CTRLA_TXPO(0x0) | SERCOM_USART_INT_CTRLA_RXPO(0x1) | SERCOM_USART_INT_CTRLA_DORD_Msk;
+  SERCOM5_REGS->USART_INT.SERCOM_CTRLB = SERCOM_USART_INT_CTRLB_CHSIZE(0x0) | SERCOM_USART_INT_CTRLB_TXEN_Msk | SERCOM_USART_INT_CTRLB_RXEN_Msk;
+  while (SERCOM5_REGS->USART_INT.SERCOM_SYNCBUSY & SERCOM_USART_INT_SYNCBUSY_CTRLB_Msk);
+  SERCOM5_REGS->USART_INT.SERCOM_BAUD = (uint16_t)63019; // 115200 @ 48MHz
+  SERCOM5_REGS->USART_INT.SERCOM_CTRLA |= SERCOM_USART_INT_CTRLA_ENABLE_Msk;
+  while (SERCOM5_REGS->USART_INT.SERCOM_SYNCBUSY & SERCOM_USART_INT_SYNCBUSY_ENABLE_Msk);
 
   // Call manual ADC initialization to completely bypass TrustZone blocks
   // that MCC library might introduce.
@@ -2010,10 +2334,121 @@ int main(void) {
   PORT_SEC_REGS->GROUP[0].PORT_OUTCLR = (1U << 17U); // output=0 means Pull-Down
   PORT_REGS->GROUP[0].PORT_OUTCLR = (1U << 17U);     // when PULLEN is 1.
 
-  PORT_SEC_REGS->GROUP[0].PORT_PINCFG[17] = 0x06U; // INEN and PULLEN enabled
-  PORT_REGS->GROUP[0].PORT_PINCFG[17] = 0x06U;
+  PORT_SEC_REGS->GROUP[0].PORT_PINCFG[17] = 0x06U; // INEN and PULLEN  // --- Setup Wi-Fi ---
+  char boot_msg[] = "\r\nWaiting 2 seconds for ESP-01S to boot up...\r\n";
+  while (SERCOM3_USART_WriteIsBusy());
+  SERCOM3_USART_Write((uint8_t *)boot_msg, strlen(boot_msg));
+  delay_ms(2000); // Give the ESP-01S time to initialize!
+
+  WIFI_Init();
+  bool wifi_connected = false;
+  
+  // 1. Check if Alive
+  bool esp_alive = false;
+  for (uint8_t retry = 0; retry < 5; retry++) {
+      if (WIFI_IsAlive()) {
+          esp_alive = true;
+          break;
+      }
+      delay_ms(1000);
+  }
+
+  // 2. Try Auto-Connect if Alive
+  if (esp_alive) {
+      char msg1[] = "ESP-01S is ALIVE. Connecting...\r\n";
+      while (SERCOM3_USART_WriteIsBusy());
+      SERCOM3_USART_Write((uint8_t *)msg1, strlen(msg1));
+      
+      WIFI_SetMode(1);
+      delay_ms(500);
+
+      if (WIFI_Connect("MONISH1", "thileep123")) {    
+          char msg2[] = "WIFI CONNECTED AUTOMATICALLY!\r\n";
+          while (SERCOM3_USART_WriteIsBusy());
+          SERCOM3_USART_Write((uint8_t *)msg2, strlen(msg2));
+          wifi_connected = true;
+      }
+  }
+
+  // 3. Smart Bridge Mode (Fallback)
+  if (!wifi_connected) {
+      char msg[] = "\r\nWi-Fi connection FAILED or ESP not responding.\r\nENTERING MANUAL BRIDGE MODE.\r\nType AT commands (e.g. AT+CWJAP=\"ssid\",\"pwd\") to connect manually.\r\nSensor readings are PAUSED until connected.\r\n";
+      while (SERCOM3_USART_WriteIsBusy());
+      SERCOM3_USART_Write((uint8_t *)msg, strlen(msg));
+      
+      uint16_t bridgeBufferIdx = 0;
+      char bridgeBuffer[128] = {0};
+
+      while (1) {
+          // Read from PuTTY (SERCOM3) -> Send to ESP (SERCOM5)
+          if (SERCOM3_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_RXC_Msk) {
+              uint8_t data = (uint8_t)SERCOM3_REGS->USART_INT.SERCOM_DATA;
+              while (!(SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_DRE_Msk));
+              SERCOM5_REGS->USART_INT.SERCOM_DATA = (uint16_t)data;
+
+              // PuTTY sends '\r' when you hit Enter. ESP needs '\r\n'. Add '\n' automatically.
+              if (data == '\r') {
+                  while (!(SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_DRE_Msk));
+                  SERCOM5_REGS->USART_INT.SERCOM_DATA = (uint16_t)'\n';
+                  while (!(SERCOM3_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_DRE_Msk));
+                  SERCOM3_REGS->USART_INT.SERCOM_DATA = (uint16_t)'\n'; // echo \n to PuTTY
+              }
+          }
+
+          // Read from ESP (SERCOM5) -> Send to PuTTY (SERCOM3)
+          if (SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_RXC_Msk) {
+              uint8_t data = (uint8_t)SERCOM5_REGS->USART_INT.SERCOM_DATA;
+              
+              // Only send to PuTTY if ready, do not block strictly forever if it causes overflow
+              if (SERCOM3_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_DRE_Msk) {
+                  SERCOM3_REGS->USART_INT.SERCOM_DATA = (uint16_t)data;
+              }
+
+              // Smart check for connection success
+              if (data == '\n' || data == '\r') {
+                  bridgeBufferIdx = 0;
+                  memset(bridgeBuffer, 0, sizeof(bridgeBuffer));
+              } else {
+                  if (bridgeBufferIdx < sizeof(bridgeBuffer) - 1) {
+                      bridgeBuffer[bridgeBufferIdx++] = (char)data;
+                      bridgeBuffer[bridgeBufferIdx] = '\0';
+                  }
+              }
+
+              // If the user manually connected successfully, exit the bridge!
+              if (strstr(bridgeBuffer, "WIFI GOT IP") != NULL || strstr(bridgeBuffer, "WIFI CONNECTED") != NULL) {
+                  char success_msg[] = "\r\nSUCCESS! Exiting Bridge Mode and Starting Sensors...\r\n";
+                  while (SERCOM3_USART_WriteIsBusy());
+                  SERCOM3_USART_Write((uint8_t *)success_msg, strlen(success_msg));
+                  break; // Breaks out of the infinite while(1) loop!
+              }
+              
+              // Clear overflow if we dropped a byte
+              if (SERCOM5_REGS->USART_INT.SERCOM_STATUS & SERCOM_USART_INT_STATUS_BUFOVF_Msk) {
+                  SERCOM5_REGS->USART_INT.SERCOM_STATUS = SERCOM_USART_INT_STATUS_BUFOVF_Msk;
+              }
+          }
+      }
+  }
+
+  // --- Connect to MQTT ---
+  char mqtt_msg[] = "\r\nConnecting to MQTT (broker.hivemq.com)...\r\n";
+  while (SERCOM3_USART_WriteIsBusy());
+  SERCOM3_USART_Write((uint8_t *)mqtt_msg, strlen(mqtt_msg));
+  
+  if (MQTT_Connect()) {
+      char m_ok[] = "MQTT CONNECTED!\r\n";
+      while (SERCOM3_USART_WriteIsBusy());
+      SERCOM3_USART_Write((uint8_t *)m_ok, strlen(m_ok));
+      MQTT_Publish("aqms/pic32/status", "online");
+  } else {
+      char m_fail[] = "MQTT CONNECTION FAILED.\r\n";
+      while (SERCOM3_USART_WriteIsBusy());
+      SERCOM3_USART_Write((uint8_t *)m_fail, strlen(m_fail));
+  }
 
   run_display();
 
   return 0;
 }
+//moni

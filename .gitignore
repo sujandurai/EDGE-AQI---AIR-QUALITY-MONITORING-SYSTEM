@@ -1,0 +1,34 @@
+# MPLAB X Build outputs
+build/
+dist/
+nbproject/private/
+*.elf
+*.hex
+*.map
+*.o
+*.d
+*.a
+*.lib
+
+# MPLAB X generated files
+.generated_files/
+*/.generated_files/
+
+# MPLAB X project private settings
+nbproject/private/
+
+# Edge Impulse compiled library objects (keep source, skip binaries)
+edge-impulse-sdk/**/*.o
+edge-impulse-sdk/**/*.d
+tflite-model/**/*.o
+tflite-model/**/*.d
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+*.suo
+*.user
